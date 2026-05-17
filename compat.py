@@ -1,4 +1,4 @@
-# Copyright 2015 The TensorFlow Authors. All Rights Reserved.
+# Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,215 +12,157 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Compatibility functions.
+"""Utilities for API compatibility between TensorFlow release versions.
 
-The `tf.compat` module contains two sets of compatibility functions.
-
-## Tensorflow 1.x and 2.x APIs
-
-The `compat.v1` and `compat.v2` submodules provide a complete copy of both the
-`v1` and `v2` APIs for backwards and forwards compatibility across TensorFlow
-versions 1.x and 2.x. See the
-[migration guide](https://www.tensorflow.org/guide/migrate) for details.
-
-## Utilities for writing compatible code
-
-Aside from the `compat.v1` and `compat.v2` submodules, `tf.compat` also contains
-a set of helper functions for writing code that works in both:
-
-* TensorFlow 1.x and 2.x
-* Python 2 and 3
-
-
-## Type collections
-
-The compatibility module also provides the following aliases for common
-sets of python types:
-
-* `bytes_or_text_types`
-* `complex_types`
-* `integral_types`
-* `real_types`
-
-API docstring: tensorflow.compat
+See [Version
+Compatibility](https://tensorflow.org/guide/version_compat#backward_forward)
 """
 
-import codecs
-import collections.abc as collections_abc  # pylint: disable=unused-import
-import numbers as _numbers
+import datetime
+import os
 
-import numpy as _np
-
+from tensorflow.python.platform import tf_logging as logging
+from tensorflow.python.util import tf_contextlib
 from tensorflow.python.util.tf_export import tf_export
 
 
-def as_bytes(bytes_or_text, encoding='utf-8'):
-  """Converts `bytearray`, `bytes`, or unicode python input types to `bytes`.
+# This value changes every day with an automatic CL. It can be modified in code
+# via `forward_compatibility_horizon()` or with the environment variable
+# TF_FORWARD_COMPATIBILITY_DELTA_DAYS, which is added to the compatibility date.
+_FORWARD_COMPATIBILITY_HORIZON = datetime.date(2026, 1, 16)
+_FORWARD_COMPATIBILITY_DELTA_DAYS_VAR_NAME = "TF_FORWARD_COMPATIBILITY_DELTA_DAYS"
+_FORWARD_COMPATIBILITY_DATE_NUMBER = None
 
-  Uses utf-8 encoding for text by default.
 
-  Args:
-    bytes_or_text: A `bytearray`, `bytes`, `str`, or `unicode` object.
-    encoding: A string indicating the charset for encoding unicode.
+def _date_to_date_number(year, month, day):
+  return (year << 9) | (month << 5) | day
 
-  Returns:
-    A `bytes` object.
 
-  Raises:
-    TypeError: If `bytes_or_text` is not a binary or unicode string.
-  """
-  # Validate encoding, a LookupError will be raised if invalid.
-  encoding = codecs.lookup(encoding).name
-  if isinstance(bytes_or_text, bytearray):
-    return bytes(bytes_or_text)
-  elif isinstance(bytes_or_text, str):
-    return bytes_or_text.encode(encoding)
-  elif isinstance(bytes_or_text, bytes):
-    return bytes_or_text
+def _update_forward_compatibility_date_number(date_to_override=None):
+  """Update the base date to compare in forward_compatible function."""
+
+  global _FORWARD_COMPATIBILITY_DATE_NUMBER
+
+  if date_to_override:
+    date = date_to_override
   else:
-    raise TypeError('Expected binary or unicode string, got %r' %
-                    (bytes_or_text,))
+    date = _FORWARD_COMPATIBILITY_HORIZON
+    delta_days = os.getenv(_FORWARD_COMPATIBILITY_DELTA_DAYS_VAR_NAME)
+    if delta_days:
+      date += datetime.timedelta(days=int(delta_days))
+
+  if date < _FORWARD_COMPATIBILITY_HORIZON:
+    logging.warning("Trying to set the forward compatibility date to the past"
+                    " date %s. This will be ignored by TensorFlow." % (date))
+    return
+  _FORWARD_COMPATIBILITY_DATE_NUMBER = _date_to_date_number(
+      date.year, date.month, date.day)
 
 
-def as_text(bytes_or_text, encoding='utf-8'):
-  """Converts any string-like python input types to unicode.
-
-  Returns the input as a unicode string. Uses utf-8 encoding for text
-  by default.
-
-  Args:
-    bytes_or_text: A `bytes`, `str`, or `unicode` object.
-    encoding: A string indicating the charset for decoding unicode.
-
-  Returns:
-    A `unicode` (Python 2) or `str` (Python 3) object.
-
-  Raises:
-    TypeError: If `bytes_or_text` is not a binary or unicode string.
-  """
-  # Validate encoding, a LookupError will be raised if invalid.
-  encoding = codecs.lookup(encoding).name
-  if isinstance(bytes_or_text, str):
-    return bytes_or_text
-  elif isinstance(bytes_or_text, bytes):
-    return bytes_or_text.decode(encoding)
-  else:
-    raise TypeError('Expected binary or unicode string, got %r' % bytes_or_text)
+_update_forward_compatibility_date_number()
 
 
-def as_str(bytes_or_text, encoding='utf-8'):
-  """Acts as an alias for the `as_text` function..
+@tf_export("compat.forward_compatible")
+def forward_compatible(year, month, day):
+  """Return true if the forward compatibility window has expired.
 
-  Args:
-    bytes_or_text: The input value to be converted. A bytes or unicode object.
-    encoding: Optional string. The encoding to use if bytes_or_text is a bytes
-      object. Defaults to 'utf-8'.
+  See [Version
+  compatibility](https://www.tensorflow.org/guide/versions#backward_and_partial_forward_compatibility).
 
-  Returns:
-    A unicode string.
+  Forward-compatibility refers to scenarios where the producer of a TensorFlow
+  model (a GraphDef or SavedModel) is compiled against a version of the
+  TensorFlow library newer than what the consumer was compiled against. The
+  "producer" is typically a Python program that constructs and trains a model
+  while the "consumer" is typically another program that loads and serves the
+  model.
 
-  Raises:
-    TypeError: If bytes_or_text is not a bytes or unicode object.
-    UnicodeDecodeError: If bytes_or_text is a bytes object and cannot be
-                        decoded using the specified encoding.
-  """
-  return as_text(bytes_or_text, encoding)
+  TensorFlow has been supporting a 3 week forward-compatibility window for
+  programs compiled from source at HEAD.
 
-tf_export('compat.as_text')(as_text)
-tf_export('compat.as_bytes')(as_bytes)
-tf_export('compat.as_str')(as_str)
+  For example, consider the case where a new operation `MyNewAwesomeAdd` is
+  created with the intent of replacing the implementation of an existing Python
+  wrapper - `tf.add`.  The Python wrapper implementation should change from
+  something like:
 
-
-@tf_export('compat.as_str_any')
-def as_str_any(value, encoding='utf-8'):
-  """Converts input to `str` type.
-
-     Uses `str(value)`, except for `bytes` typed inputs, which are converted
-     using `as_str`.
-
-  Args:
-    value: A object that can be converted to `str`.
-    encoding: Encoding for `bytes` typed inputs.
-
-  Returns:
-    A `str` object.
-  """
-  if isinstance(value, bytes):
-    return as_str(value, encoding=encoding)
-  else:
-    return str(value)
-
-
-@tf_export('compat.path_to_str')
-def path_to_str(path):
-  r"""Converts input which is a `PathLike` object to `str` type.
-
-  Converts from any python constant representation of a `PathLike` object to
-  a string. If the input is not a `PathLike` object, simply returns the input.
-
-  Args:
-    path: An object that can be converted to path representation.
-
-  Returns:
-    A `str` object.
-
-  Usage:
-    In case a simplified `str` version of the path is needed from an
-    `os.PathLike` object.
-
-  Examples:
   ```python
-  $ tf.compat.path_to_str('C:\XYZ\tensorflow\./.././tensorflow')
-  'C:\XYZ\tensorflow\./.././tensorflow' # Windows OS
-  $ tf.compat.path_to_str(Path('C:\XYZ\tensorflow\./.././tensorflow'))
-  'C:\XYZ\tensorflow\..\tensorflow' # Windows OS
-  $ tf.compat.path_to_str(Path('./corpus'))
-  'corpus' # Linux OS
-  $ tf.compat.path_to_str('./.././Corpus')
-  './.././Corpus' # Linux OS
-  $ tf.compat.path_to_str(Path('./.././Corpus'))
-  '../Corpus' # Linux OS
-  $ tf.compat.path_to_str(Path('./..////../'))
-  '../..' # Linux OS
-
+  def add(inputs, name=None):
+    return gen_math_ops.add(inputs, name)
   ```
-  """
-  if hasattr(path, '__fspath__'):
-    path = as_str_any(path.__fspath__())
-  return path
 
+  to:
 
-def path_to_bytes(path):
-  r"""Converts input which is a `PathLike` object to `bytes`.
+  ```python
+  from tensorflow.python.compat import compat
 
-  Converts from any python constant representation of a `PathLike` object
-  or `str` to bytes.
+  def add(inputs, name=None):
+    if compat.forward_compatible(year, month, day):
+      # Can use the awesome new implementation.
+      return gen_math_ops.my_new_awesome_add(inputs, name)
+    # To maintain forward compatibility, use the old implementation.
+    return gen_math_ops.add(inputs, name)
+  ```
+
+  Where `year`, `month`, and `day` specify the date beyond which binaries
+  that consume a model are expected to have been updated to include the
+  new operations. This date is typically at least 3 weeks beyond the date
+  the code that adds the new operation is committed.
 
   Args:
-    path: An object that can be converted to path representation.
+    year:  A year (e.g., 2018). Must be an `int`.
+    month: A month (1 <= month <= 12) in year. Must be an `int`.
+    day:   A day (1 <= day <= 31, or 30, or 29, or 28) in month. Must be an
+      `int`.
 
   Returns:
-    A `bytes` object.
-
-  Usage:
-    In case a simplified `bytes` version of the path is needed from an
-    `os.PathLike` object.
+    True if the caller can expect that serialized TensorFlow graphs produced
+    can be consumed by programs that are compiled with the TensorFlow library
+    source code after (year, month, day).
   """
-  if hasattr(path, '__fspath__'):
-    path = path.__fspath__()
-  return as_bytes(path)
+  return _FORWARD_COMPATIBILITY_DATE_NUMBER > _date_to_date_number(
+      year, month, day)
 
 
-# Numpy 1.8 scalars don't inherit from numbers.Integral in Python 3, so we
-# need to check them specifically.  The same goes from Real and Complex.
-integral_types = (_numbers.Integral, _np.integer)
-tf_export('compat.integral_types').export_constant(__name__, 'integral_types')
-real_types = (_numbers.Real, _np.integer, _np.floating)
-tf_export('compat.real_types').export_constant(__name__, 'real_types')
-complex_types = (_numbers.Complex, _np.number)
-tf_export('compat.complex_types').export_constant(__name__, 'complex_types')
+@tf_export("compat.forward_compatibility_horizon")
+@tf_contextlib.contextmanager
+def forward_compatibility_horizon(year, month, day):
+  """Context manager for testing forward compatibility of generated graphs.
 
-# Either bytes or text.
-bytes_or_text_types = (bytes, str)
-tf_export('compat.bytes_or_text_types').export_constant(__name__,
-                                                        'bytes_or_text_types')
+  See [Version
+  compatibility](https://www.tensorflow.org/guide/versions#backward_and_partial_forward_compatibility).
+
+  To ensure forward compatibility of generated graphs (see `forward_compatible`)
+  with older binaries, new features can be gated with:
+
+  ```python
+  if compat.forward_compatible(year=2018, month=08, day=01):
+    generate_graph_with_new_features()
+  else:
+    generate_graph_so_older_binaries_can_consume_it()
+  ```
+
+  However, when adding new features, one may want to unittest it before
+  the forward compatibility window expires. This context manager enables
+  such tests. For example:
+
+  ```python
+  from tensorflow.python.compat import compat
+
+  def testMyNewFeature(self):
+    with compat.forward_compatibility_horizon(2018, 08, 02):
+       # Test that generate_graph_with_new_features() has an effect
+  ```
+
+  Args:
+    year:  A year (e.g., 2018). Must be an `int`.
+    month: A month (1 <= month <= 12) in year. Must be an `int`.
+    day:   A day (1 <= day <= 31, or 30, or 29, or 28) in month. Must be an
+      `int`.
+
+  Yields:
+    Nothing.
+  """
+  try:
+    _update_forward_compatibility_date_number(datetime.date(year, month, day))
+    yield
+  finally:
+    _update_forward_compatibility_date_number()
