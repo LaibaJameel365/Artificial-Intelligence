@@ -1,4 +1,4 @@
-# Copyright 2023 The TensorFlow Authors. All Rights Reserved.
+# Copyright 2016 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,5 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Core module for TensorFlow distribution objects and helpers."""
-from tensorflow.python.ops.distributions import distributions
+"""Bijector base."""
+
+# go/tf-wildcard-import
+# pylint: disable=wildcard-import,unused-import
+from tensorflow.python.ops.distributions.bijector_impl import Bijector
+
+# pylint: enable=wildcard-import,unused-import
