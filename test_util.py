@@ -1,4 +1,4 @@
-# Copyright 2018 The TensorFlow Authors. All Rights Reserved.
+# Copyright 2017 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,65 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Test utility."""
+"""Test utilities for tf.signal."""
 
-import numpy as np
-
-from tensorflow.python.ops import variables
-from tensorflow.python.ops.parallel_for import control_flow_ops as pfor_control_flow_ops
-from tensorflow.python.platform import test
-from tensorflow.python.util import nest
+from tensorflow.core.protobuf import config_pb2
+from tensorflow.python.grappler import tf_optimizer
+from tensorflow.python.training import saver
 
 
-class PForTestCase(test.TestCase):
-  """Base class for test cases."""
+def grappler_optimize(graph, fetches=None, config_proto=None):
+  """Tries to optimize the provided graph using grappler.
 
-  def _run_targets(self, targets1, targets2=None, run_init=True):
-    targets1 = nest.flatten(targets1)
-    targets2 = ([] if targets2 is None else nest.flatten(targets2))
-    assert len(targets1) == len(targets2) or not targets2
-    if run_init:
-      init = variables.global_variables_initializer()
-      self.evaluate(init)
-    return self.evaluate(targets1 + targets2)
+  Args:
+    graph: A `tf.Graph` instance containing the graph to optimize.
+    fetches: An optional list of `Tensor`s to fetch (i.e. not optimize away).
+      Grappler uses the 'train_op' collection to look for fetches, so if not
+      provided this collection should be non-empty.
+    config_proto: An optional `tf.compat.v1.ConfigProto` to use when rewriting
+      the graph.
 
-  # TODO(agarwal): Allow tests to pass down tolerances.
-  def run_and_assert_equal(self, targets1, targets2, rtol=1e-4, atol=1e-5):
-    outputs = self._run_targets(targets1, targets2)
-    outputs = nest.flatten(outputs)  # flatten SparseTensorValues
-    n = len(outputs) // 2
-    for i in range(n):
-      if outputs[i + n].dtype != np.object_:
-        self.assertAllClose(outputs[i + n], outputs[i], rtol=rtol, atol=atol)
-      else:
-        self.assertAllEqual(outputs[i + n], outputs[i])
+  Returns:
+    A `tf.compat.v1.GraphDef` containing the rewritten graph.
+  """
+  if config_proto is None:
+    config_proto = config_pb2.ConfigProto()
+    config_proto.graph_options.rewrite_options.min_graph_nodes = -1
+  if fetches is not None:
+    for fetch in fetches:
+      graph.add_to_collection('train_op', fetch)
+  metagraph = saver.export_meta_graph(graph_def=graph.as_graph_def())
+  return tf_optimizer.OptimizeGraph(config_proto, metagraph)
 
-  def _test_loop_fn(self,
-                    loop_fn,
-                    iters,
-                    parallel_iterations=None,
-                    fallback_to_while_loop=False,
-                    rtol=1e-4,
-                    atol=1e-5):
-    t1 = pfor_control_flow_ops.pfor(
-        loop_fn,
-        iters=iters,
-        fallback_to_while_loop=fallback_to_while_loop,
-        parallel_iterations=parallel_iterations)
-    loop_fn_dtypes = nest.map_structure(lambda x: x.dtype, t1)
-    t2 = pfor_control_flow_ops.for_loop(loop_fn, loop_fn_dtypes, iters=iters,
-                                        parallel_iterations=parallel_iterations)
-
-    def _check_shape(a, b):
-      msg = (
-          "Inferred static shapes are different between two loops:"
-          f" {a.shape} vs {b.shape}."
-      )
-      # TODO(b/268146947): should assert bool(a.shape) == bool(b.shape),
-      # since both should be either defined or undefined. But it does not work.
-      if b.shape:
-        self.assertEqual(a.shape.as_list()[0], b.shape.as_list()[0], msg)
-        # TODO(b/268146947): self.assertShapeEqual(a, b, msg) does not work.
-
-    nest.map_structure(_check_shape, t1, t2)
-    self.run_and_assert_equal(t1, t2, rtol=rtol, atol=atol)

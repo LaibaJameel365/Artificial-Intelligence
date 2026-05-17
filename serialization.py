@@ -1,4 +1,4 @@
-# Copyright 2018 The TensorFlow Authors. All Rights Reserved.
+# Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,67 +12,106 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Utilities for serializing Python objects."""
+"""Layer serialization/deserialization functions.
+"""
+# pylint: disable=wildcard-import
+# pylint: disable=unused-import
 
-import numpy as np
-import wrapt
+import threading
 
-from tensorflow.python.framework import dtypes
-from tensorflow.python.framework import tensor_shape
-from tensorflow.python.util.compat import collections_abc
+from tensorflow.python import tf2
+from tensorflow.python.keras.engine import base_layer
+from tensorflow.python.keras.engine import input_layer
+from tensorflow.python.keras.engine import input_spec
+from tensorflow.python.keras.layers import advanced_activations
+from tensorflow.python.keras.layers import convolutional
+from tensorflow.python.keras.layers import convolutional_recurrent
+from tensorflow.python.keras.layers import core
+from tensorflow.python.keras.layers import dense_attention
+from tensorflow.python.keras.layers import embeddings
+from tensorflow.python.keras.layers import merge
+from tensorflow.python.keras.layers import pooling
+from tensorflow.python.keras.layers import recurrent
+from tensorflow.python.keras.layers import rnn_cell_wrapper_v2
+from tensorflow.python.keras.utils import generic_utils
+from tensorflow.python.keras.utils import tf_inspect as inspect
+
+ALL_MODULES = (base_layer, input_layer, advanced_activations, convolutional,
+               convolutional_recurrent, core, dense_attention,
+               embeddings, merge, pooling, recurrent)
+ALL_V2_MODULES = (rnn_cell_wrapper_v2,)
+# ALL_OBJECTS is meant to be a global mutable. Hence we need to make it
+# thread-local to avoid concurrent mutations.
+LOCAL = threading.local()
 
 
-def get_json_type(obj):
-  """Serializes any object to a JSON-serializable structure.
+def populate_deserializable_objects():
+  """Populates dict ALL_OBJECTS with every built-in layer.
+  """
+  global LOCAL
+  if not hasattr(LOCAL, 'ALL_OBJECTS'):
+    LOCAL.ALL_OBJECTS = {}
+    LOCAL.GENERATED_WITH_V2 = None
+
+  if LOCAL.ALL_OBJECTS and LOCAL.GENERATED_WITH_V2 == tf2.enabled():
+    # Objects dict is already generated for the proper TF version:
+    # do nothing.
+    return
+
+  LOCAL.ALL_OBJECTS = {}
+  LOCAL.GENERATED_WITH_V2 = tf2.enabled()
+
+  base_cls = base_layer.Layer
+  generic_utils.populate_dict_with_module_objects(
+      LOCAL.ALL_OBJECTS,
+      ALL_MODULES,
+      obj_filter=lambda x: inspect.isclass(x) and issubclass(x, base_cls))
+
+  # Overwrite certain V1 objects with V2 versions
+  if tf2.enabled():
+    generic_utils.populate_dict_with_module_objects(
+        LOCAL.ALL_OBJECTS,
+        ALL_V2_MODULES,
+        obj_filter=lambda x: inspect.isclass(x) and issubclass(x, base_cls))
+
+  # Prevent circular dependencies.
+  from tensorflow.python.keras import models  # pylint: disable=g-import-not-at-top
+
+  LOCAL.ALL_OBJECTS['Input'] = input_layer.Input
+  LOCAL.ALL_OBJECTS['InputSpec'] = input_spec.InputSpec
+  LOCAL.ALL_OBJECTS['Functional'] = models.Functional
+  LOCAL.ALL_OBJECTS['Model'] = models.Model
+  LOCAL.ALL_OBJECTS['Sequential'] = models.Sequential
+
+  # Merge layers, function versions.
+  LOCAL.ALL_OBJECTS['add'] = merge.add
+  LOCAL.ALL_OBJECTS['subtract'] = merge.subtract
+  LOCAL.ALL_OBJECTS['multiply'] = merge.multiply
+  LOCAL.ALL_OBJECTS['average'] = merge.average
+  LOCAL.ALL_OBJECTS['maximum'] = merge.maximum
+  LOCAL.ALL_OBJECTS['minimum'] = merge.minimum
+  LOCAL.ALL_OBJECTS['concatenate'] = merge.concatenate
+  LOCAL.ALL_OBJECTS['dot'] = merge.dot
+
+
+def serialize(layer):
+  return generic_utils.serialize_keras_object(layer)
+
+
+def deserialize(config, custom_objects=None):
+  """Instantiates a layer from a config dictionary.
 
   Args:
-      obj: the object to serialize
+      config: dict of the form {'class_name': str, 'config': dict}
+      custom_objects: dict mapping class names (or function names)
+          of custom (non-Keras) objects to class/functions
 
   Returns:
-      JSON-serializable structure representing `obj`.
-
-  Raises:
-      TypeError: if `obj` cannot be serialized.
+      Layer instance (may be Model, Sequential, Network, Layer...)
   """
-  # if obj is a serializable Keras class instance
-  # e.g. optimizer, layer
-  if hasattr(obj, 'get_config'):
-    return {'class_name': obj.__class__.__name__, 'config': obj.get_config()}
-
-  # if obj is any numpy type
-  if type(obj).__module__ == np.__name__:
-    if isinstance(obj, np.ndarray):
-      return obj.tolist()
-    else:
-      return obj.item()
-
-  # misc functions (e.g. loss function)
-  if callable(obj):
-    return obj.__name__
-
-  # if obj is a python 'type'
-  if type(obj).__name__ == type.__name__:
-    return obj.__name__
-
-  if isinstance(obj, tensor_shape.Dimension):
-    return obj.value
-
-  if isinstance(obj, tensor_shape.TensorShape):
-    return obj.as_list()
-
-  if isinstance(obj, dtypes.DType):
-    return obj.name
-
-  if isinstance(obj, collections_abc.Mapping):
-    return dict(obj)
-
-  if obj is Ellipsis:
-    return {'class_name': '__ellipsis__'}
-
-  if isinstance(obj, wrapt.ObjectProxy):
-    return obj.__wrapped__
-
-  raise TypeError(f'Object {obj} is not JSON-serializable. You may implement '
-                  'a `get_config()` method on the class '
-                  '(returning a JSON-serializable dictionary) to make it '
-                  'serializable.')
+  populate_deserializable_objects()
+  return generic_utils.deserialize_keras_object(
+      config,
+      module_objects=LOCAL.ALL_OBJECTS,
+      custom_objects=custom_objects,
+      printable_module_name='layer')

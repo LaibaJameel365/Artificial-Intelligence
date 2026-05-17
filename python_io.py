@@ -11,12 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# =============================================================================
-"""Contains the base Layer class, from which all layers inherit."""
-from tensorflow.python.keras.legacy_tf_layers import base
+# ==============================================================================
 
-InputSpec = base.InputSpec
+"""Python functions for directly manipulating TFRecord-formatted files.
 
-keras_style_scope = base.keras_style_scope
-set_keras_style = base.set_keras_style
-Layer = base.Layer
+API docstring: tensorflow.python_io
+"""
+
+# go/tf-wildcard-import
+# pylint: disable=wildcard-import
+from tensorflow.python.lib.io.tf_record import *
+# pylint: enable=wildcard-import

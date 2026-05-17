@@ -12,11 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # =============================================================================
-"""Contains the base Layer class, from which all layers inherit."""
-from tensorflow.python.keras.legacy_tf_layers import base
 
-InputSpec = base.InputSpec
+"""Contains the normalization layer classes and their functional aliases.
+"""
 
-keras_style_scope = base.keras_style_scope
-set_keras_style = base.set_keras_style
-Layer = base.Layer
+from tensorflow.python.util import lazy_loader
+
+normalization = lazy_loader.LazyLoader(
+    'normalization', globals(),
+    'tf_keras.legacy_tf_layers.normalization')
+
+
+# pylint: disable=invalid-name
+# lazy load all the attributes until they are accessed for the first time
+def __getattr__(name):
+  if name in ['BatchNormalization', 'BatchNorm']:
+    return normalization.BatchNormalization
+  elif name in ['batch_normalization', 'batch_norm']:
+    return normalization.batch_normalization
+  else:
+    raise AttributeError(f'module {__name__} doesn\'t have attribute {name}')
