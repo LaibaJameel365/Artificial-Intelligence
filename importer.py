@@ -1,332 +1,566 @@
-"""This module implements a post import hook mechanism styled after what is
-described in PEP-369. Note that it doesn't cope with modules being reloaded.
+# Copyright 2015 The TensorFlow Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+"""A utility function for importing TensorFlow graphs."""
+import contextlib
 
-"""
-
-import importlib.metadata
-import sys
-import threading
-from importlib.util import find_spec
-from typing import Callable, Dict, List
-
-from .__wrapt__ import BaseObjectProxy
-
-# The dictionary registering any post import hooks to be triggered once
-# the target module has been imported. Once a module has been imported
-# and the hooks fired, the list of hooks recorded against the target
-# module will be truncated but the list left in the dictionary. This
-# acts as a flag to indicate that the module had already been imported.
-
-_post_import_hooks: Dict[str, List[Callable]] = {}
-_post_import_hooks_init = False
-_post_import_hooks_lock = threading.RLock()
-
-# Register a new post import hook for the target module name. This
-# differs from the PEP-369 implementation in that it also allows the
-# hook function to be specified as a string consisting of the name of
-# the callback in the form 'module:function'. This will result in a
-# proxy callback being registered which will defer loading of the
-# specified module containing the callback function until required.
-
-
-def _create_import_hook_from_string(name):
-    def import_hook(module):
-        module_name, function = name.split(":")
-        attrs = function.split(".")
-        __import__(module_name)
-        callback = sys.modules[module_name]
-        for attr in attrs:
-            callback = getattr(callback, attr)
-        return callback(module)
-
-    return import_hook
+from tensorflow.core.framework import graph_pb2
+from tensorflow.python import tf2
+from tensorflow.python.client import pywrap_tf_session as c_api
+from tensorflow.python.framework import c_api_util
+from tensorflow.python.framework import device as pydev
+from tensorflow.python.framework import errors
+from tensorflow.python.framework import function
+from tensorflow.python.framework import op_def_registry
+from tensorflow.python.framework import ops
+from tensorflow.python.framework import tensor
+from tensorflow.python.ops import control_flow_util
+from tensorflow.python.util import compat
+from tensorflow.python.util.deprecation import deprecated_args
+from tensorflow.python.util.tf_export import tf_export
 
 
-def register_post_import_hook(hook, name):
-    """
-    Register a post import hook for the target module `name`. The `hook`
-    function will be called once the module is imported and will be passed the
-    module as argument. If the module is already imported, the `hook` will be
-    called immediately. If you also want to defer loading of the module containing
-    the `hook` function until required, you can specify the `hook` as a string in
-    the form 'module:function'. This will result in a proxy hook function being
-    registered which will defer loading of the specified module containing the
-    callback function until required.
-    """
-
-    # Create a deferred import hook if hook is a string name rather than
-    # a callable function.
-
-    if isinstance(hook, str):
-        hook = _create_import_hook_from_string(hook)
-
-    with _post_import_hooks_lock:
-        # Automatically install the import hook finder if it has not already
-        # been installed.
-
-        global _post_import_hooks_init
-
-        if not _post_import_hooks_init:
-            _post_import_hooks_init = True
-            sys.meta_path.insert(0, ImportHookFinder())
-
-        # Check if the module is already imported. If not, register the hook
-        # to be called after import.
-
-        module = sys.modules.get(name, None)
-
-        if module is None:
-            _post_import_hooks.setdefault(name, []).append(hook)
-
-    # If the module is already imported, we fire the hook right away. Note that
-    # the hook is called outside of the lock to avoid deadlocks if code run as a
-    # consequence of calling the module import hook in turn triggers a separate
-    # thread which tries to register an import hook.
-
-    if module is not None:
-        hook(module)
+# TODO(b/307794935): Remove after bug is fixed.
+is_oss = True  # Updated by copybara.
 
 
-# Register post import hooks defined as package entry points.
+def _IsControlInput(input_name):
+  # Expected format: '^operation_name' (control input).
+  return input_name.startswith('^')
 
 
-def _create_import_hook_from_entrypoint(entrypoint):
-    def import_hook(module):
-        entrypoint_value = entrypoint.value.split(":")
-        module_name = entrypoint_value[0]
-        __import__(module_name)
-        callback = sys.modules[module_name]
+def _ParseTensorName(tensor_name):
+  """Parses a tensor name into an operation name and output index.
 
-        if len(entrypoint_value) > 1:
-            attrs = entrypoint_value[1].split(".")
-            for attr in attrs:
-                callback = getattr(callback, attr)
-        return callback(module)
+  This function will canonicalize tensor names as follows:
 
-    return import_hook
+  * "foo:0"       -> ("foo", 0)
+  * "foo:7"       -> ("foo", 7)
+  * "foo"         -> ("foo", 0)
+  * "foo:bar:baz" -> ValueError
 
+  Args:
+    tensor_name: The name of a tensor.
 
-def discover_post_import_hooks(group):
-    """
-    Discover and register post import hooks defined as package entry points
-    in the specified `group`. The group should be a string that matches the
-    entry point group name used in the package metadata.
-    """
+  Returns:
+    A tuple containing the operation name, and the output index.
 
+  Raises:
+    ValueError: If `tensor_name' cannot be interpreted as the name of a tensor.
+  """
+  components = tensor_name.split(':')
+  if len(components) == 2:
+    # Expected format: 'operation_name:output_index'.
     try:
-        # Python 3.10+ style with select parameter
-        entrypoints = importlib.metadata.entry_points(group=group)
+      output_index = int(components[1])
+    except ValueError:
+      raise ValueError(f'Cannot convert {tensor_name!r} to a tensor name. '
+                       'Second component of the name following the `:` should '
+                       f'be an int. Got {components[1]}.')
+    return components[0], output_index
+  elif len(components) == 1:
+    # Expected format: 'operation_name' (implicit 0th output).
+    return components[0], 0
+  else:
+    raise ValueError(f"Cannot convert '{tensor_name}' to a tensor name. Tensor "
+                     'names should not contain more than 1 `:`. Obtained '
+                     f'{len(components) - 1}')
+
+
+@contextlib.contextmanager
+def _MaybeDevice(device):
+  """Applies the given device only if device is not None or empty."""
+  if device:
+    with ops.device(device):
+      yield
+  else:
+    yield
+
+
+def _ProcessGraphDefParam(graph_def):
+  """Type-checks and possibly canonicalizes `graph_def`."""
+  if not isinstance(graph_def, graph_pb2.GraphDef):
+    # `graph_def` could be a dynamically-created message, so try a duck-typed
+    # approach
+    try:
+      old_graph_def = graph_def
+      graph_def = graph_pb2.GraphDef()
+      graph_def.MergeFrom(old_graph_def)
     except TypeError:
-        # Python 3.8-3.9 style that returns a dict
-        entrypoints = importlib.metadata.entry_points().get(group, ())
+      raise TypeError('Argument `graph_def` must be a GraphDef proto.')
+  else:
+    # If we're using the graph_def provided by the caller, modify graph_def
+    # in-place to add attr defaults to the NodeDefs (this is visible to the
+    # caller).
+    # NOTE(skyewm): this is undocumented behavior that at least meta_graph.py
+    # depends on. It might make sense to move this to meta_graph.py and have
+    # import_graph_def not modify the graph_def argument (we'd have to make sure
+    # this doesn't break anything else.)
+    for node in graph_def.node:
+      op_def = op_def_registry.get(node.op)
+      if op_def is None:
+        # Assume unrecognized ops are functions for now. TF_ImportGraphDef will
+        # report an error if the op is actually missing.
+        continue
+      _SetDefaultAttrValues(node, op_def)
 
-    for entrypoint in entrypoints:
-        callback = entrypoint.load()  # Use the loaded callback directly
-        register_post_import_hook(callback, entrypoint.name)
-
-
-# Indicate that a module has been loaded. Any post import hooks which
-# were registered against the target module will be invoked. If an
-# exception is raised in any of the post import hooks, that will cause
-# the import of the target module to fail.
-
-
-def notify_module_loaded(module):
-    """
-    Notify that a `module` has been loaded and invoke any post import hooks
-    registered against the module. If the module is not registered, this
-    function does nothing.
-    """
-
-    name = getattr(module, "__name__", None)
-
-    with _post_import_hooks_lock:
-        hooks = _post_import_hooks.pop(name, ())
-
-    # Note that the hook is called outside of the lock to avoid deadlocks if
-    # code run as a consequence of calling the module import hook in turn
-    # triggers a separate thread which tries to register an import hook.
-
-    for hook in hooks:
-        hook(module)
+  return graph_def
 
 
-# A custom module import finder. This intercepts attempts to import
-# modules and watches out for attempts to import target modules of
-# interest. When a module of interest is imported, then any post import
-# hooks which are registered will be invoked.
+def _ProcessInputMapParam(input_map):
+  """Type-checks and possibly canonicalizes `input_map`."""
+  if input_map is None:
+    input_map = {}
+  else:
+    if not isinstance(input_map, dict):
+      raise TypeError('Argument `input_map` must be a dictionary. Obtained '
+                      f'{type(input_map).__name__}')
+    if not all(
+        isinstance(k, compat.bytes_or_text_types) for k in input_map.keys()):
+      raise TypeError('All keys for argument `input_map` must be strings. '
+                      f'Obtained keys: {list(input_map.keys())}')
+  return input_map
 
 
-class _ImportHookLoader:
-
-    def load_module(self, fullname):
-        module = sys.modules[fullname]
-        notify_module_loaded(module)
-
-        return module
-
-
-class _ImportHookChainedLoader(BaseObjectProxy):
-
-    def __init__(self, loader):
-        super(_ImportHookChainedLoader, self).__init__(loader)
-
-        if hasattr(loader, "load_module"):
-            self.__self_setattr__("load_module", self._self_load_module)
-        if hasattr(loader, "create_module"):
-            self.__self_setattr__("create_module", self._self_create_module)
-        if hasattr(loader, "exec_module"):
-            self.__self_setattr__("exec_module", self._self_exec_module)
-
-    def _self_set_loader(self, module):
-        # Set module's loader to self.__wrapped__ unless it's already set to
-        # something else. Import machinery will set it to spec.loader if it is
-        # None, so handle None as well. The module may not support attribute
-        # assignment, in which case we simply skip it. Note that we also deal
-        # with __loader__ not existing at all. This is to future proof things
-        # due to proposal to remove the attribute as described in the GitHub
-        # issue at https://github.com/python/cpython/issues/77458. Also prior
-        # to Python 3.3, the __loader__ attribute was only set if a custom
-        # module loader was used. It isn't clear whether the attribute still
-        # existed in that case or was set to None.
-
-        class UNDEFINED:
-            pass
-
-        if getattr(module, "__loader__", UNDEFINED) in (None, self):
-            try:
-                module.__loader__ = self.__wrapped__
-            except AttributeError:
-                pass
-
-        if (
-            getattr(module, "__spec__", None) is not None
-            and getattr(module.__spec__, "loader", None) is self
-        ):
-            module.__spec__.loader = self.__wrapped__
-
-    def _self_load_module(self, fullname):
-        module = self.__wrapped__.load_module(fullname)
-        self._self_set_loader(module)
-        notify_module_loaded(module)
-
-        return module
-
-    # Python 3.4 introduced create_module() and exec_module() instead of
-    # load_module() alone. Splitting the two steps.
-
-    def _self_create_module(self, spec):
-        return self.__wrapped__.create_module(spec)
-
-    def _self_exec_module(self, module):
-        self._self_set_loader(module)
-        self.__wrapped__.exec_module(module)
-        notify_module_loaded(module)
+def _ProcessReturnElementsParam(return_elements):
+  """Type-checks and possibly canonicalizes `return_elements`."""
+  if return_elements is None:
+    return None
+  if not all(
+      isinstance(x, compat.bytes_or_text_types) for x in return_elements):
+    raise TypeError('Argument `return_elements` must be a list of strings. '
+                    f'Obtained {return_elements}.')
+  return tuple(compat.as_str(x) for x in return_elements)
 
 
-class ImportHookFinder:
-
-    def __init__(self):
-        self.in_progress = {}
-
-    def find_module(self, fullname, path=None):
-        # If the module being imported is not one we have registered
-        # post import hooks for, we can return immediately. We will
-        # take no further part in the importing of this module.
-
-        with _post_import_hooks_lock:
-            if fullname not in _post_import_hooks:
-                return None
-
-        # When we are interested in a specific module, we will call back
-        # into the import system a second time to defer to the import
-        # finder that is supposed to handle the importing of the module.
-        # We set an in progress flag for the target module so that on
-        # the second time through we don't trigger another call back
-        # into the import system and cause a infinite loop.
-
-        if fullname in self.in_progress:
-            return None
-
-        self.in_progress[fullname] = True
-
-        # Now call back into the import system again.
-
-        try:
-            # For Python 3 we need to use find_spec().loader
-            # from the importlib.util module. It doesn't actually
-            # import the target module and only finds the
-            # loader. If a loader is found, we need to return
-            # our own loader which will then in turn call the
-            # real loader to import the module and invoke the
-            # post import hooks.
-
-            loader = getattr(find_spec(fullname), "loader", None)
-
-            if loader and not isinstance(loader, _ImportHookChainedLoader):
-                return _ImportHookChainedLoader(loader)
-
-        finally:
-            del self.in_progress[fullname]
-
-    def find_spec(self, fullname, path=None, target=None):
-        # Since Python 3.4, you are meant to implement find_spec() method
-        # instead of find_module() and since Python 3.10 you get deprecation
-        # warnings if you don't define find_spec().
-
-        # If the module being imported is not one we have registered
-        # post import hooks for, we can return immediately. We will
-        # take no further part in the importing of this module.
-
-        with _post_import_hooks_lock:
-            if fullname not in _post_import_hooks:
-                return None
-
-        # When we are interested in a specific module, we will call back
-        # into the import system a second time to defer to the import
-        # finder that is supposed to handle the importing of the module.
-        # We set an in progress flag for the target module so that on
-        # the second time through we don't trigger another call back
-        # into the import system and cause a infinite loop.
-
-        if fullname in self.in_progress:
-            return None
-
-        self.in_progress[fullname] = True
-
-        # Now call back into the import system again.
-
-        try:
-            # This should only be Python 3 so find_spec() should always
-            # exist so don't need to check.
-
-            spec = find_spec(fullname)
-            loader = getattr(spec, "loader", None)
-
-            if loader and not isinstance(loader, _ImportHookChainedLoader):
-                spec.loader = _ImportHookChainedLoader(loader)
-
-            return spec
-
-        finally:
-            del self.in_progress[fullname]
+def _FindAttrInOpDef(attr_name, op_def):
+  for attr_def in op_def.attr:
+    if attr_name == attr_def.name:
+      return attr_def
+  return None
 
 
-# Decorator for marking that a function should be called as a post
-# import hook when the target module is imported.
+def _RemoveDefaultAttrs(producer_op_list, graph_def):
+  """Removes unknown default attrs according to `producer_op_list`.
+
+  Removes any unknown attrs in `graph_def` (i.e. attrs that do not appear in
+  registered OpDefs) that have a default value in `producer_op_list`.
+
+  Args:
+    producer_op_list: OpList proto.
+    graph_def: GraphDef proto
+  """
+  producer_op_dict = {op.name: op for op in producer_op_list.op}
+  for node in graph_def.node:
+    # Remove any default attr values that aren't in op_def.
+    if node.op in producer_op_dict:
+      op_def = op_def_registry.get(node.op)
+      if op_def is None:
+        # Some custom op registrations won't show up here. That's OK, attribute
+        # stripping just won't be available.
+        continue
+      producer_op_def = producer_op_dict[node.op]
+      # We make a copy of node.attr to iterate through since we may modify
+      # node.attr inside the loop.
+      for key in list(node.attr):
+        if _FindAttrInOpDef(key, op_def) is None:
+          # No attr_def in consumer, look in producer.
+          attr_def = _FindAttrInOpDef(key, producer_op_def)
+          if (attr_def and attr_def.HasField('default_value') and
+              node.attr[key] == attr_def.default_value):
+            # Unknown attr had default value in producer, delete it so it can be
+            # understood by consumer.
+            del node.attr[key]
 
 
-def when_imported(name):
-    """
-    Returns a decorator that registers the decorated function as a post import
-    hook for the module specified by `name`. The function will be called once
-    the module with the specified name is imported, and will be passed the
-    module as argument. If the module is already imported, the function will
-    be called immediately.
-    """
+def _ConvertInputMapValues(name, input_map):
+  """Ensures all input map values are tensors.
 
-    def register(hook):
-        register_post_import_hook(hook, name)
-        return hook
+  This should be called from inside the import name scope.
 
-    return register
+  Args:
+    name: the `name` argument passed to import_graph_def
+    input_map: the `input_map` argument passed to import_graph_def.
+
+  Returns:
+    An possibly-updated version of `input_map`.
+
+  Raises:
+    ValueError: if input map values cannot be converted due to empty name scope.
+  """
+  if not all(isinstance(v, tensor.Tensor) for v in input_map.values()):
+    if name == '':  # pylint: disable=g-explicit-bool-comparison
+      raise ValueError(
+          'tf.import_graph_def() requires a non-empty `name` if `input_map` '
+          'contains non-Tensor values. Try calling tf.convert_to_tensor() on '
+          '`input_map` values before calling tf.import_graph_def().')
+    with ops.name_scope('_inputs'):
+      input_map = {k: ops.convert_to_tensor(v) for k, v in input_map.items()}
+  return input_map
+
+
+def _PopulateTFImportGraphDefOptions(options, prefix, input_map,
+                                     return_elements,
+                                     validate_colocation_constraints,
+                                     propagate_device_spec=False):
+  """Populates the TF_ImportGraphDefOptions `options`."""
+  c_api.TF_ImportGraphDefOptionsSetPrefix(options, prefix)
+  c_api.TF_ImportGraphDefOptionsSetUniquifyNames(options, True)
+  c_api.TF_ImportGraphDefOptionsSetPropagateDeviceSpec(options,
+                                                       propagate_device_spec)
+
+  for input_src, input_dst in input_map.items():
+    input_src = compat.as_str(input_src)
+    if input_src.startswith('^'):
+      src_name = compat.as_str(input_src[1:])
+      dst_op = input_dst._as_tf_output().oper  # pylint: disable=protected-access
+      c_api.TF_ImportGraphDefOptionsRemapControlDependency(
+          options, src_name, dst_op)
+    else:
+      src_name, src_idx = _ParseTensorName(input_src)
+      src_name = compat.as_str(src_name)
+      dst_output = input_dst._as_tf_output()  # pylint: disable=protected-access
+      c_api.TF_ImportGraphDefOptionsAddInputMapping(options, src_name, src_idx,
+                                                    dst_output)
+  for name in return_elements or []:
+    if ':' in name:
+      op_name, index = _ParseTensorName(name)
+      op_name = compat.as_str(op_name)
+      c_api.TF_ImportGraphDefOptionsAddReturnOutput(options, op_name, index)
+    else:
+      c_api.TF_ImportGraphDefOptionsAddReturnOperation(options,
+                                                       compat.as_str(name))
+
+  c_api.TF_ImportGraphDefOptionsSetValidateColocationConstraints(
+      options, validate_colocation_constraints)
+
+
+def _ProcessNewOps(graph):
+  """Processes the newly-added TF_Operations in `graph`."""
+  # Maps from a node to the names of the ops it's colocated with, if colocation
+  # is specified in the attributes.
+  colocation_pairs = {}
+
+  for new_op in graph._add_new_tf_operations(compute_devices=False):  # pylint: disable=protected-access
+    original_device = new_op.device
+    new_op._set_device('')  # pylint: disable=protected-access
+    colocation_names = _GetColocationNames(new_op)
+    if colocation_names:
+      colocation_pairs[new_op] = colocation_names
+      # Don't set a device for this op, since colocation constraints override
+      # device functions and the original device. Note that this op's device may
+      # still be set by the loop below.
+      # TODO(skyewm): why does it override the original device?
+    else:
+      with _MaybeDevice(original_device):
+        graph._apply_device_functions(new_op)  # pylint: disable=protected-access
+
+  # The following loop populates the device field of ops that are colocated
+  # with another op.  This is implied by the colocation attribute, but we
+  # propagate the device field for completeness.
+  for op, coloc_op_list in colocation_pairs.items():
+    coloc_device = None
+    # Find any device in the list of colocated ops that have a device, if it
+    # exists.  We assume that if multiple ops have devices, they refer to the
+    # same device.  Otherwise, a runtime error will occur since the colocation
+    # property cannot be guaranteed.  Note in TF2 colocations have been removed
+    # from the public API and will be considered a hint, so there is no runtime
+    # error.
+    #
+    # One possible improvement is to try to check for compatibility of all
+    # devices in this list at import time here, which would require
+    # implementing a compatibility function for device specs in python.
+    for coloc_op_name in coloc_op_list:
+      try:
+        coloc_op = graph._get_operation_by_name(coloc_op_name)  # pylint: disable=protected-access
+      except KeyError:
+        # Do not error in TF2 if the colocation cannot be guaranteed
+        if tf2.enabled() or control_flow_util.EnableControlFlowV2(graph):
+          continue
+
+        raise ValueError(f'Specified colocation to an op: {coloc_op_name} that '
+                         f'does not exist during import for op: {op.name}')
+      if coloc_op.device:
+        coloc_device = pydev.DeviceSpec.from_string(coloc_op.device)
+        break
+    if coloc_device:
+      op._set_device(coloc_device)  # pylint: disable=protected-access
+
+
+def _GetColocationNames(op):
+  """Returns names of the ops that `op` should be colocated with."""
+  colocation_names = []
+  try:
+    class_values = op.get_attr('_class')
+  except ValueError:
+    # No _class attr
+    return
+  for val in class_values:
+    val = compat.as_str(val)
+    if val.startswith('loc:@'):
+      colocation_node_name = val[len('loc:@'):]
+      if colocation_node_name != op.name:
+        colocation_names.append(colocation_node_name)
+  return colocation_names
+
+
+def _GatherReturnElements(requested_return_elements, graph, results):
+  """Returns the requested return elements from results.
+
+  Args:
+    requested_return_elements: list of strings of operation and tensor names
+    graph: Graph
+    results: wrapped TF_ImportGraphDefResults
+
+  Returns:
+    list of `Operation` and/or `Tensor` objects
+  """
+  return_outputs = c_api.TF_ImportGraphDefResultsReturnOutputs(results)
+  return_opers = c_api.TF_ImportGraphDefResultsReturnOperations(results)
+
+  combined_return_elements = []
+  outputs_idx = 0
+  opers_idx = 0
+  for name in requested_return_elements:
+    if ':' in name:
+      combined_return_elements.append(
+          graph._get_tensor_by_tf_output(return_outputs[outputs_idx]))  # pylint: disable=protected-access
+      outputs_idx += 1
+    else:
+      combined_return_elements.append(
+          graph._get_operation_by_tf_operation(return_opers[opers_idx]))  # pylint: disable=protected-access
+      opers_idx += 1
+  return combined_return_elements
+
+
+def _SetDefaultAttrValues(node_def, op_def):
+  """Set any default attr values in `node_def` that aren't present."""
+  assert node_def.op == op_def.name
+  for attr_def in op_def.attr:
+    key = attr_def.name
+    if attr_def.HasField('default_value'):
+      value = node_def.attr[key]
+      if value is None or value.WhichOneof('value') is None:
+        node_def.attr[key].CopyFrom(attr_def.default_value)
+
+
+@tf_export('graph_util.import_graph_def', 'import_graph_def')
+@deprecated_args(None, 'Please file an issue at '
+                 'https://github.com/tensorflow/tensorflow/issues if you depend'
+                 ' on this feature.', 'op_dict')
+def import_graph_def(graph_def,
+                     input_map=None,
+                     return_elements=None,
+                     name=None,
+                     op_dict=None,
+                     producer_op_list=None):
+  """Imports the graph from `graph_def` into the current default `Graph`.
+
+  This function provides a way to import a serialized TensorFlow
+  [`GraphDef`](https://www.tensorflow.org/code/tensorflow/core/framework/graph.proto)
+  protocol buffer, and extract individual objects in the `GraphDef` as
+  `tf.Tensor` and `tf.Operation` objects. Once extracted,
+  these objects are placed into the current default `Graph`. See
+  `tf.Graph.as_graph_def` for a way to create a `GraphDef`
+  proto.
+
+  Args:
+    graph_def: A `GraphDef` proto containing operations to be imported into
+      the default graph.
+    input_map: A dictionary mapping input names (as strings) in `graph_def`
+      to `Tensor` objects. The values of the named input tensors in the
+      imported graph will be re-mapped to the respective `Tensor` values.
+    return_elements: A list of strings containing operation names in
+      `graph_def` that will be returned as `Operation` objects; and/or
+      tensor names in `graph_def` that will be returned as `Tensor` objects.
+    name: (Optional.) A prefix that will be prepended to the names in
+      `graph_def`. Note that this does not apply to imported function names.
+      Defaults to `"import"`.
+    op_dict: (Optional.) Deprecated, do not use.
+    producer_op_list: (Optional.) An `OpList` proto with the (possibly stripped)
+      list of `OpDef`s used by the producer of the graph. If provided,
+      unrecognized attrs for ops in `graph_def` that have their default value
+      according to `producer_op_list` will be removed. This will allow some more
+      `GraphDef`s produced by later binaries to be accepted by earlier binaries.
+
+  Returns:
+    A list of `Operation` and/or `Tensor` objects from the imported graph,
+    corresponding to the names in `return_elements`,
+    and None if `returns_elements` is None.
+
+  Raises:
+    TypeError: If `graph_def` is not a `GraphDef` proto,
+      `input_map` is not a dictionary mapping strings to `Tensor` objects,
+      or `return_elements` is not a list of strings.
+    ValueError: If `input_map`, or `return_elements` contains names that
+      do not appear in `graph_def`, or `graph_def` is not well-formed (e.g.
+      it refers to an unknown tensor).
+  """
+  del op_dict
+  return _import_graph_def_internal(
+      graph_def,
+      input_map=input_map,
+      return_elements=return_elements,
+      name=name,
+      producer_op_list=producer_op_list)
+
+
+def import_graph_def_for_function(  # pylint: disable=invalid-name
+    graph_def, name=None, propagate_device_spec=False):
+  """Like import_graph_def but does not validate colocation constraints."""
+  return _import_graph_def_internal(
+      graph_def,
+      validate_colocation_constraints=False,
+      name=name,
+      propagate_device_spec=propagate_device_spec)
+
+
+def _import_graph_def_internal(  # pylint: disable=invalid-name
+    graph_def,
+    input_map=None,
+    return_elements=None,
+    validate_colocation_constraints=True,
+    name=None,
+    producer_op_list=None,
+    propagate_device_spec=False):
+  """Imports the graph from `graph_def` into the current default `Graph`.
+
+  This function provides a way to import a serialized TensorFlow
+  [`GraphDef`](https://www.tensorflow.org/code/tensorflow/core/framework/graph.proto)
+  protocol buffer, and extract individual objects in the `GraphDef` as
+  `tf.Tensor` and `tf.Operation` objects. Once extracted,
+  these objects are placed into the current default `Graph`. See
+  `tf.Graph.as_graph_def` for a way to create a `GraphDef`
+  proto.
+
+  Args:
+    graph_def: A `GraphDef` proto containing operations to be imported into the
+      default graph.
+    input_map: A dictionary mapping input names (as strings) in `graph_def` to
+      `Tensor` objects. The values of the named input tensors in the imported
+      graph will be re-mapped to the respective `Tensor` values.
+    return_elements: A list of strings containing operation names in `graph_def`
+      that will be returned as `Operation` objects; and/or tensor names in
+      `graph_def` that will be returned as `Tensor` objects.
+    validate_colocation_constraints: Whether to validate colocation constraints.
+    name: (Optional.) A prefix that will be prepended to the names in
+      `graph_def`. Note that this does not apply to imported function names.
+      Defaults to `"import"`.
+    producer_op_list: (Optional.) An `OpList` proto with the (possibly stripped)
+      list of `OpDef`s used by the producer of the graph. If provided,
+      unrecognized attrs for ops in `graph_def` that have their default value
+      according to `producer_op_list` will be removed. This will allow some more
+      `GraphDef`s produced by later binaries to be accepted by earlier binaries.
+    propagate_device_spec: Whether to propagate assigned device information
+      when importing a graph from a GraphDef into the current default `Graph`.
+
+  Returns:
+    A list of `Operation` and/or `Tensor` objects from the imported graph,
+    corresponding to the names in `return_elements`,
+    and None if `returns_elements` is None.
+
+  Raises:
+    TypeError: If `graph_def` is not a `GraphDef` proto,
+      `input_map` is not a dictionary mapping strings to `Tensor` objects,
+      or `return_elements` is not a list of strings.
+    ValueError: If `input_map`, or `return_elements` contains names that
+      do not appear in `graph_def`, or `graph_def` is not well-formed (e.g.
+      it refers to an unknown tensor).
+  """
+  graph_def = _ProcessGraphDefParam(graph_def)
+  input_map = _ProcessInputMapParam(input_map)
+  return_elements = _ProcessReturnElementsParam(return_elements)
+
+  if producer_op_list is not None:
+    # TODO(skyewm): make a copy of graph_def so we're not mutating the argument?
+    _RemoveDefaultAttrs(producer_op_list, graph_def)
+
+  graph = ops.get_default_graph()
+  with ops.name_scope(name, 'import', input_map.values()) as scope:
+    # Save unique prefix generated by name_scope
+    if scope:
+      assert scope.endswith('/')
+      prefix = scope[:-1]
+    else:
+      prefix = ''
+
+    # Generate any input map tensors inside name scope
+    input_map = _ConvertInputMapValues(name, input_map)
+
+  scoped_options = c_api_util.ScopedTFImportGraphDefOptions()
+  options = scoped_options.options
+  _PopulateTFImportGraphDefOptions(options, prefix, input_map, return_elements,
+                                   validate_colocation_constraints,
+                                   propagate_device_spec)
+
+  # _ProcessNewOps mutates the new operations. _mutation_lock ensures a
+  # Session.run call cannot occur between creating the TF_Operations in the
+  # TF_GraphImportGraphDefWithResults call and mutating them in _ProcessNewOps.
+  with graph._mutation_lock():  # pylint: disable=protected-access
+    if is_oss:
+      graph_def_input = c_api.TF_NewBufferFromString(
+          compat.as_bytes(graph_def.SerializeToString())
+      )
+      graph_import_graphdef = c_api.TF_GraphImportGraphDefWithResults
+    else:
+      graph_def_input = graph_def
+      graph_import_graphdef = (
+          c_api.TF_GraphImportGraphDefWithResultsNoSerialization
+      )
+    try:
+      with graph._c_graph.get() as c_graph:  # pylint: disable=protected-access
+        results = graph_import_graphdef(c_graph, graph_def_input, options)
+      results = c_api_util.ScopedTFImportGraphDefResults(results)
+    except errors.InvalidArgumentError as e:
+      # Convert to ValueError for backwards compatibility.
+      raise ValueError(str(e))
+    finally:
+      if is_oss:
+        c_api.TF_DeleteBuffer(graph_def_input)
+
+    # Create _DefinedFunctions for any imported functions.
+    #
+    # We do this by creating _DefinedFunctions directly from `graph_def`, and
+    # adding them to `graph`. Adding an existing function to a TF_Graph is a
+    # no-op, so this only has the effect of updating the Python state (usually
+    # _DefinedFunction.add_to_graph also adds the function to the TF_Graph).
+    #
+    # TODO(skyewm): fetch the TF_Functions directly from the TF_Graph
+    # TODO(skyewm): avoid sending serialized FunctionDefs back to the TF_Graph
+
+    _ProcessNewOps(graph)
+
+  if graph_def.library and graph_def.library.function:
+    functions = function.from_library(graph_def.library)
+    for f in functions:
+      f.add_to_graph(graph)
+
+  # Treat input mappings that don't appear in the graph as an error, because
+  # they are likely to be due to a typo.
+  missing_unused_input_keys = (
+      c_api.TF_ImportGraphDefResultsMissingUnusedInputMappings_wrapper(
+          results.results))
+  if missing_unused_input_keys:
+    missing_unused_input_keys = [
+        compat.as_str(s) for s in missing_unused_input_keys
+    ]
+    missing_keys = ', '.join(missing_unused_input_keys)
+    raise ValueError(
+        'Attempted to map inputs that were not found in graph_def: '
+        f'[{missing_keys}]')
+
+  if return_elements is None:
+    return None
+  else:
+    return _GatherReturnElements(return_elements, graph, results.results)

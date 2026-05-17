@@ -1,4 +1,4 @@
-# Copyright 2020 The TensorFlow Authors. All Rights Reserved.
+# Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,95 +12,72 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""This module customizes `test_combinations` for `tf.keras` related tests."""
+"""This module customizes `test_combinations` for Tensorflow.
+
+Additionally it provides `generate()`, `combine()` and `times()` with Tensorflow
+customizations as a default.
+"""
 
 import functools
 
 from tensorflow.python import tf2
-from tensorflow.python.framework import combinations
+from tensorflow.python.eager import context
+from tensorflow.python.framework import ops
 from tensorflow.python.framework import test_combinations
-from tensorflow.python.keras import testing_utils
-
-KERAS_MODEL_TYPES = ['functional', 'subclass', 'sequential']
+from tensorflow.python.util.tf_export import tf_export
 
 
-def keras_mode_combinations(mode=None, run_eagerly=None):
-  """Returns the default test combinations for tf.keras tests.
+class EagerGraphCombination(test_combinations.TestCombination):
+  """Run the test in Graph or Eager mode.
 
-  Note that if tf2 is enabled, then v1 session test will be skipped.
-
-  Args:
-    mode: List of modes to run the tests. The valid options are 'graph' and
-      'eager'. Default to ['graph', 'eager'] if not specified. If a empty list
-      is provide, then the test will run under the context based on tf's
-      version, eg graph for v1 and eager for v2.
-    run_eagerly: List of `run_eagerly` value to be run with the tests.
-      Default to [True, False] if not specified. Note that for `graph` mode,
-      run_eagerly value will only be False.
-
-  Returns:
-    A list contains all the combinations to be used to generate test cases.
-  """
-  if mode is None:
-    mode = ['eager'] if tf2.enabled() else ['graph', 'eager']
-  if run_eagerly is None:
-    run_eagerly = [True, False]
-  result = []
-  if 'eager' in mode:
-    result += combinations.combine(mode=['eager'], run_eagerly=run_eagerly)
-  if 'graph' in mode:
-    result += combinations.combine(mode=['graph'], run_eagerly=[False])
-  return result
-
-
-def keras_model_type_combinations():
-  return combinations.combine(model_type=KERAS_MODEL_TYPES)
-
-
-class KerasModeCombination(test_combinations.TestCombination):
-  """Combination for Keras test mode.
-
-  It by default includes v1_session, v2_eager and v2_tf_function.
+  The optional `mode` parameter controls the test's execution mode.  Its
+  accepted values are "graph" or "eager" literals.
   """
 
   def context_managers(self, kwargs):
-    run_eagerly = kwargs.pop('run_eagerly', None)
-
-    if run_eagerly is not None:
-      return [testing_utils.run_eagerly_scope(run_eagerly)]
-    else:
+    mode = kwargs.pop("mode", None)
+    if mode is None:
       return []
+    elif mode == "eager":
+      return [context.eager_mode()]
+    elif mode == "graph":
+      return [ops.Graph().as_default(), context.graph_mode()]
+    else:
+      raise ValueError(
+          "Argument 'mode' must be either 'eager' or 'graph'. "
+          f"Received: {mode}.")
 
   def parameter_modifiers(self):
-    return [test_combinations.OptionalParameter('run_eagerly')]
+    return [test_combinations.OptionalParameter("mode")]
 
 
-class KerasModelTypeCombination(test_combinations.TestCombination):
-  """Combination for Keras model types when doing model test.
+class TFVersionCombination(test_combinations.TestCombination):
+  """Control the execution of the test in TF1.x and TF2.
 
-  It by default includes 'functional', 'subclass', 'sequential'.
+  If TF2 is enabled then a test with TF1 test is going to be skipped and vice
+  versa.
 
-  Various methods in `testing_utils` to get models will auto-generate a model
-  of the currently active Keras model type. This allows unittests to confirm
-  the equivalence between different Keras models.
+  Test targets continuously run in TF2 thanks to the tensorflow.v2 TAP target.
+  A test can be run in TF2 with bazel by passing --test_env=TF2_BEHAVIOR=1.
   """
 
-  def context_managers(self, kwargs):
-    model_type = kwargs.pop('model_type', None)
-    if model_type in KERAS_MODEL_TYPES:
-      return [testing_utils.model_type_scope(model_type)]
-    else:
-      return []
+  def should_execute_combination(self, kwargs):
+    tf_api_version = kwargs.pop("tf_api_version", None)
+    if tf_api_version == 1 and tf2.enabled():
+      return (False, "Skipping a TF1.x test when TF2 is enabled.")
+    elif tf_api_version == 2 and not tf2.enabled():
+      return (False, "Skipping a TF2 test when TF2 is not enabled.")
+    return (True, None)
 
   def parameter_modifiers(self):
-    return [test_combinations.OptionalParameter('model_type')]
+    return [test_combinations.OptionalParameter("tf_api_version")]
 
 
-_defaults = combinations.generate.keywords['test_combinations']
 generate = functools.partial(
-    combinations.generate,
-    test_combinations=_defaults +
-    (KerasModeCombination(), KerasModelTypeCombination()))
+    test_combinations.generate,
+    test_combinations=(EagerGraphCombination(), TFVersionCombination()))
 combine = test_combinations.combine
 times = test_combinations.times
 NamedObject = test_combinations.NamedObject
+
+tf_export("__internal__.test.combinations.generate", v1=[])(generate)
