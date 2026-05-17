@@ -1,4 +1,4 @@
-# Copyright 2020 The TensorFlow Authors. All Rights Reserved.
+# Copyright 2023 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,12 +17,14 @@
 import contextlib
 import threading
 
+from tensorflow.python.util.tf_export import tf_export
+
 
 class LoadContext(threading.local):
   """A context for loading a model."""
 
   def __init__(self):
-    super(LoadContext, self).__init__()
+    super().__init__()
     self._entered_load_context = []
     self._load_options = None
 
@@ -44,6 +46,7 @@ class LoadContext(threading.local):
 _load_context = LoadContext()
 
 
+@tf_export("__internal__.load_context", v1=[])
 @contextlib.contextmanager
 def load_context(load_options):
   _load_context.set_load_options(load_options)
