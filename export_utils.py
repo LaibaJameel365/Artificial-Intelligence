@@ -12,33 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+# LINT.IfChange
 """Utilities for creating SavedModels."""
 
 import collections
 import os
 import time
 
-from tensorflow.python.lib.io import file_io
-from tensorflow.python.ops import op_selector
+from tensorflow.python.keras.saving.utils_v1 import export_output as export_output_lib
+from tensorflow.python.keras.saving.utils_v1 import mode_keys
+from tensorflow.python.keras.saving.utils_v1 import unexported_constants
+from tensorflow.python.keras.saving.utils_v1.mode_keys import KerasModeKeys as ModeKeys
 from tensorflow.python.platform import gfile
 from tensorflow.python.platform import tf_logging as logging
 from tensorflow.python.saved_model import signature_constants
 from tensorflow.python.saved_model import signature_def_utils
 from tensorflow.python.saved_model import tag_constants
-from tensorflow.python.saved_model import utils
-from tensorflow.python.saved_model.model_utils import export_output as export_output_lib
-from tensorflow.python.saved_model.model_utils import mode_keys
-from tensorflow.python.saved_model.model_utils.mode_keys import KerasModeKeys as ModeKeys
 from tensorflow.python.util import compat
-from tensorflow.python.util import nest
-from tensorflow.python.util import object_identity
 
 
 # Mapping of the modes to appropriate MetaGraph tags in the SavedModel.
 EXPORT_TAG_MAP = mode_keys.ModeKeyMap(**{
     ModeKeys.PREDICT: [tag_constants.SERVING],
     ModeKeys.TRAIN: [tag_constants.TRAINING],
-    ModeKeys.TEST: [tag_constants.EVAL]})
+    ModeKeys.TEST: [unexported_constants.EVAL]})
 
 # For every exported mode, a SignatureDef map should be created using the
 # functions `export_outputs_for_mode` and `build_all_signature_defs`. By
@@ -47,8 +44,8 @@ EXPORT_TAG_MAP = mode_keys.ModeKeyMap(**{
 # The default keys used in the SignatureDef map are defined below.
 SIGNATURE_KEY_MAP = mode_keys.ModeKeyMap(**{
     ModeKeys.PREDICT: signature_constants.DEFAULT_SERVING_SIGNATURE_DEF_KEY,
-    ModeKeys.TRAIN: signature_constants.DEFAULT_TRAIN_SIGNATURE_DEF_KEY,
-    ModeKeys.TEST: signature_constants.DEFAULT_EVAL_SIGNATURE_DEF_KEY})
+    ModeKeys.TRAIN: unexported_constants.DEFAULT_TRAIN_SIGNATURE_DEF_KEY,
+    ModeKeys.TEST: unexported_constants.DEFAULT_EVAL_SIGNATURE_DEF_KEY})
 
 # Default names used in the SignatureDef input map, which maps strings to
 # TensorInfo protos.
@@ -57,54 +54,6 @@ SINGLE_RECEIVER_DEFAULT_NAME = 'input'
 SINGLE_LABEL_DEFAULT_NAME = 'label'
 
 ### Below utilities are specific to SavedModel exports.
-
-
-def _must_be_fed(op):
-  return op.type == 'Placeholder'
-
-
-def _ensure_servable(input_tensors, names_to_output_tensor_infos):
-  """Check that the signature outputs don't depend on unreachable placeholders.
-
-  Args:
-    input_tensors: An iterable of `Tensor`s specified as the signature's inputs.
-    names_to_output_tensor_infos: An mapping from output names to respective
-      `TensorInfo`s corresponding to the signature's output tensors.
-
-  Raises:
-    ValueError: If any of the signature's outputs depend on placeholders not
-      provided as signature's inputs.
-  """
-  plain_input_tensors = nest.flatten(input_tensors, expand_composites=True)
-
-  graph = op_selector.get_unique_graph(plain_input_tensors)
-
-  output_tensors = [
-      utils.get_tensor_from_tensor_info(tensor, graph=graph)
-      for tensor in names_to_output_tensor_infos.values()
-  ]
-  plain_output_tensors = nest.flatten(output_tensors, expand_composites=True)
-
-  dependency_ops = op_selector.get_backward_walk_ops(
-      plain_output_tensors, stop_at_ts=plain_input_tensors)
-
-  fed_tensors = object_identity.ObjectIdentitySet(plain_input_tensors)
-  for dependency_op in dependency_ops:
-    if _must_be_fed(dependency_op) and (not all(
-        output in fed_tensors for output in dependency_op.outputs)):
-      input_tensor_names = [tensor.name for tensor in plain_input_tensors]
-      output_tensor_keys = list(names_to_output_tensor_infos.keys())
-      output_tensor_names = [tensor.name for tensor in plain_output_tensors]
-      dependency_path = op_selector.show_path(dependency_op,
-                                              plain_output_tensors,
-                                              plain_input_tensors)
-      raise ValueError(
-          f'The signature\'s input tensors {input_tensor_names} are '
-          f'insufficient to compute its output keys {output_tensor_keys} '
-          f'(respectively, tensors {output_tensor_names}) because of the '
-          f'dependency on `{dependency_op.name}` which is not given as '
-          'a signature input, as illustrated by the following dependency path: '
-          f'{dependency_path}')
 
 
 def build_all_signature_defs(receiver_tensors,
@@ -140,18 +89,15 @@ def build_all_signature_defs(receiver_tensors,
   if not isinstance(receiver_tensors, dict):
     receiver_tensors = {SINGLE_RECEIVER_DEFAULT_NAME: receiver_tensors}
   if export_outputs is None or not isinstance(export_outputs, dict):
-    raise ValueError('`export_outputs` must be a dict. Received '
-                     f'{export_outputs} with type '
-                     f'{type(export_outputs).__name__}.')
+    raise ValueError('export_outputs must be a dict and not'
+                     '{}'.format(type(export_outputs)))
 
   signature_def_map = {}
   excluded_signatures = {}
-  input_tensors = receiver_tensors.values()
   for output_key, export_output in export_outputs.items():
     signature_name = '{}'.format(output_key or 'None')
     try:
       signature = export_output.as_signature_def(receiver_tensors)
-      _ensure_servable(input_tensors, signature.outputs)
       signature_def_map[signature_name] = signature
     except ValueError as e:
       excluded_signatures[signature_name] = str(e)
@@ -163,13 +109,11 @@ def build_all_signature_defs(receiver_tensors,
         receiver_tensors_alt = {
             SINGLE_RECEIVER_DEFAULT_NAME: receiver_tensors_alt
         }
-      alt_input_tensors = receiver_tensors_alt.values()
       for output_key, export_output in export_outputs.items():
         signature_name = '{}:{}'.format(receiver_name or 'None', output_key or
                                         'None')
         try:
           signature = export_output.as_signature_def(receiver_tensors_alt)
-          _ensure_servable(alt_input_tensors, signature.outputs)
           signature_def_map[signature_name] = signature
         except ValueError as e:
           excluded_signatures[signature_name] = str(e)
@@ -196,8 +140,8 @@ _FRIENDLY_METHOD_NAMES = {
     signature_constants.CLASSIFY_METHOD_NAME: 'Classify',
     signature_constants.REGRESS_METHOD_NAME: 'Regress',
     signature_constants.PREDICT_METHOD_NAME: 'Predict',
-    signature_constants.SUPERVISED_TRAIN_METHOD_NAME: 'Train',
-    signature_constants.SUPERVISED_EVAL_METHOD_NAME: 'Eval',
+    unexported_constants.SUPERVISED_TRAIN_METHOD_NAME: 'Train',
+    unexported_constants.SUPERVISED_EVAL_METHOD_NAME: 'Eval',
 }
 
 
@@ -228,10 +172,10 @@ def _log_signature_report(signature_def_map, excluded_signatures):
       logging.info('\'{}\' : {}'.format(signature_name, message))
 
   if not signature_def_map:
-    logging.warn('Export includes no signatures!')
+    logging.warning('Export includes no signatures!')
   elif (signature_constants.DEFAULT_SERVING_SIGNATURE_DEF_KEY not in
         signature_def_map):
-    logging.warn('Export includes no default signature!')
+    logging.warning('Export includes no default signature!')
 
 
 # When we create a timestamped directory, there is a small chance that the
@@ -264,7 +208,7 @@ def get_timestamped_export_dir(export_dir_base):
   while attempts < MAX_DIRECTORY_CREATION_ATTEMPTS:
     timestamp = int(time.time())
 
-    result_dir = file_io.join(
+    result_dir = os.path.join(
         compat.as_bytes(export_dir_base), compat.as_bytes(str(timestamp)))
     if not gfile.Exists(result_dir):
       # Collisions are still possible (though extremely unlikely): this
@@ -273,10 +217,12 @@ def get_timestamped_export_dir(export_dir_base):
       return result_dir
     time.sleep(1)
     attempts += 1
-    logging.warn('Directory {} already exists; retrying (attempt {}/{})'.format(
-        compat.as_str(result_dir), attempts, MAX_DIRECTORY_CREATION_ATTEMPTS))
+    logging.warning(
+        'Directory {} already exists; retrying (attempt {}/{})'.format(
+            compat.as_str(result_dir), attempts,
+            MAX_DIRECTORY_CREATION_ATTEMPTS))
   raise RuntimeError('Failed to obtain a unique export directory name after '
-                     f'{MAX_DIRECTORY_CREATION_ATTEMPTS} attempts.')
+                     '{} attempts.'.format(MAX_DIRECTORY_CREATION_ATTEMPTS))
 
 
 def get_temp_export_dir(timestamped_export_dir):
@@ -297,8 +243,9 @@ def get_temp_export_dir(timestamped_export_dir):
     str_name = basename.decode('utf-8')
   else:
     str_name = str(basename)
-  temp_export_dir = file_io.join(
-      compat.as_bytes(dirname), compat.as_bytes('temp-{}'.format(str_name)))
+  temp_export_dir = os.path.join(
+      compat.as_bytes(dirname),
+      compat.as_bytes('temp-{}'.format(str_name)))
   return temp_export_dir
 
 
@@ -331,8 +278,8 @@ def export_outputs_for_mode(
   """
   if mode not in SIGNATURE_KEY_MAP:
     raise ValueError(
-        f'Export output type not found for `mode`: {mode}. Expected one of: '
-        f'{list(SIGNATURE_KEY_MAP.keys())}.')
+        'Export output type not found for mode: {}. Expected one of: {}.\n'
+        .format(mode, SIGNATURE_KEY_MAP.keys()))
   signature_key = SIGNATURE_KEY_MAP[mode]
   if mode_keys.is_predict(mode):
     return get_export_outputs(serving_export_outputs, predictions)
@@ -365,13 +312,13 @@ def get_export_outputs(export_outputs, predictions):
         signature_constants.DEFAULT_SERVING_SIGNATURE_DEF_KEY: default_output}
 
   if not isinstance(export_outputs, dict):
-    raise TypeError(
-        f'`export_outputs` must be dict, received: {export_outputs}.')
+    raise TypeError('export_outputs must be dict, given: {}'.format(
+        export_outputs))
   for v in export_outputs.values():
     if not isinstance(v, export_output_lib.ExportOutput):
       raise TypeError(
-          'Values in `export_outputs` must be ExportOutput objects, '
-          f'received: {export_outputs}.')
+          'Values in export_outputs must be ExportOutput objects. '
+          'Given: {}'.format(export_outputs))
 
   _maybe_add_default_serving_output(export_outputs)
 
@@ -401,9 +348,9 @@ def _maybe_add_default_serving_output(export_outputs):
     if (signature_constants.DEFAULT_SERVING_SIGNATURE_DEF_KEY
         not in export_outputs):
       raise ValueError(
-          'Multiple `export_outputs` were provided, but none of them are '
-          'specified as the default. Use'
-          '`tf.saved_model.DEFAULT_SERVING_SIGNATURE_DEF_KEY` to '
-          'specify a default.')
+          'Multiple export_outputs were provided, but none of them is '
+          'specified as the default.  Do this by naming one of them with '
+          'signature_constants.DEFAULT_SERVING_SIGNATURE_DEF_KEY.')
 
   return export_outputs
+# LINT.ThenChange(//tensorflow/python/saved_model/model_utils/export_utils.py)

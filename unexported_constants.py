@@ -1,4 +1,4 @@
-# Copyright 2018 The TensorFlow Authors. All Rights Reserved.
+# Copyright 2020 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,8 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Keras model mode constants."""
+"""Signature constants for SavedModel save and restore operations.
 
-# pylint: disable=unused-import
-from tensorflow.python.saved_model.model_utils.mode_keys import KerasModeKeys as ModeKeys
-# pylint: enable=unused-import
+These are the private constants that have not been exported.
+"""
+
+# LINT.IfChange
+DEFAULT_TRAIN_SIGNATURE_DEF_KEY = "train"
+
+DEFAULT_EVAL_SIGNATURE_DEF_KEY = "eval"
+
+SUPERVISED_TRAIN_METHOD_NAME = "tensorflow/supervised/training"
+
+SUPERVISED_EVAL_METHOD_NAME = "tensorflow/supervised/eval"
+# LINT.ThenChange(//tensorflow/python/saved_model/signature_constants.py)
+
+# LINT.IfChange
+EVAL = "eval"
+# LINT.ThenChange(//tensorflow/python/saved_model/tag_constants.py)

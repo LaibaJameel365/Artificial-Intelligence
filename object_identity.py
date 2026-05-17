@@ -13,14 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+
+import collections
 from typing import Any, Set
 import weakref
 
-from tensorflow.python.util.compat import collections_abc
-
 
 # LINT.IfChange
-class _ObjectIdentityWrapper:
+class _ObjectIdentityWrapper(object):
   """Wraps an object, mapping __eq__ on wrapper to "is" on wrapped.
 
   Since __eq__ is based on object identity, it's safe to also define __hash__
@@ -116,7 +116,7 @@ class Reference(_ObjectIdentityWrapper):
     return self._wrapped
 
 
-class ObjectIdentityDictionary(collections_abc.MutableMapping):
+class ObjectIdentityDictionary(collections.abc.MutableMapping):
   """A mutable mapping data structure which compares using "is".
 
   This is necessary because we have trackable objects (_ListWrapper) which
@@ -174,7 +174,7 @@ class ObjectIdentityWeakKeyDictionary(ObjectIdentityDictionary):
         yield unwrapped
 
 
-class ObjectIdentitySet(collections_abc.MutableSet):
+class ObjectIdentitySet(collections.abc.MutableSet):
   """Like the built-in set, but compares objects with "is"."""
 
   __slots__ = ["_storage", "__weakref__"]
@@ -262,4 +262,4 @@ class ObjectIdentityWeakSet(ObjectIdentitySet):
         self.discard(key)
       else:
         yield unwrapped
-# LINT.ThenChange(//tensorflow/python/keras/utils/object_identity.py)
+# LINT.ThenChange(//tensorflow/python/util/object_identity.py)
