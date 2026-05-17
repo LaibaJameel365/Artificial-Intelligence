@@ -1,4 +1,4 @@
-# Copyright 2020 The TensorFlow Authors. All Rights Reserved.
+# Copyright 2017 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,41 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Conditional expressions (e.g. the ternary if statement)."""
+"""Converts the ternary conditional operator."""
+
+import gast
+
+from tensorflow.python.autograph.core import converter
+from tensorflow.python.autograph.pyct import parser
+from tensorflow.python.autograph.pyct import templates
 
 
-from tensorflow.python.autograph.operators import control_flow
-from tensorflow.python.autograph.utils import tensors
-from tensorflow.python.ops import cond as tf_cond
+class ConditionalExpressionTransformer(converter.Base):
+  """Converts conditional expressions to functional form."""
+
+  def visit_IfExp(self, node):
+    template = '''
+        ag__.if_exp(
+            test,
+            lambda: true_expr,
+            lambda: false_expr,
+            expr_repr)
+    '''
+    expr_repr = parser.unparse(node.test, include_encoding_marker=False).strip()
+    return templates.replace_as_expression(
+        template,
+        test=node.test,
+        true_expr=node.body,
+        false_expr=node.orelse,
+        expr_repr=gast.Constant(expr_repr, kind=None))
 
 
-def if_exp(cond, if_true, if_false, expr_repr):
-  if tensors.is_dense_tensor(cond):
-    return _tf_if_exp(cond, if_true, if_false, expr_repr)
-  else:
-    return _py_if_exp(cond, if_true, if_false)
-
-
-def _tf_if_exp(cond, if_true, if_false, expr_repr):
-  """Overload of if_exp that stages a TF cond."""
-  # TODO(mdan): Use nonlocal once we no longer need to support py2.
-  true_val = []
-  false_val = []
-
-  def true_fn():
-    true_val.append(if_true())
-    if true_val and false_val:
-      control_flow.verify_single_cond_var(expr_repr, true_val[0], false_val[0])
-    return true_val[0]
-
-  def false_fn():
-    false_val.append(if_false())
-    if true_val and false_val:
-      control_flow.verify_single_cond_var(expr_repr, true_val[0], false_val[0])
-    return false_val[0]
-
-  return tf_cond.cond(cond, true_fn, false_fn)
-
-
-def _py_if_exp(cond, if_true, if_false):
-  return if_true() if cond else if_false()
+def transform(node, ctx):
+  node = ConditionalExpressionTransformer(ctx).visit(node)
+  return node

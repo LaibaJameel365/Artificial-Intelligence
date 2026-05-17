@@ -1,4 +1,4 @@
-# Copyright 2018 The TensorFlow Authors. All Rights Reserved.
+# Copyright 2022 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,153 +12,172 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Utilities for testing random variables."""
+"""Utilities for extracting and writing checkpoint info`."""
 
-import math
+from tensorflow.core.protobuf import trackable_object_graph_pb2
+from tensorflow.python.ops import resource_variable_ops
+from tensorflow.python.ops import variables
+from tensorflow.python.trackable import trackable_utils
+from tensorflow.python.util import object_identity
 
-import numpy as np
 
-from tensorflow.python.ops.distributions import special_math
+def serialize_slot_variables(trackable_objects, node_ids, object_names):
+  """Gather and name slot variables."""
+  non_slot_objects = list(trackable_objects)
+  slot_variables = object_identity.ObjectIdentityDictionary()
+  for trackable in non_slot_objects:
+        # TODO(b/110718070): Fix Keras imports.
+        # Note: dir() is used rather than hasattr() here to avoid triggering
+        # custom __getattr__ code, see b/152031870 for context.
+    if "get_slot_names" in dir(trackable):
+      slot_names = trackable.get_slot_names()
+      for slot_name in slot_names:
+        for original_variable_node_id, original_variable in enumerate(
+            non_slot_objects):
+          try:
+            slot_variable = trackable.get_slot(original_variable, slot_name)
+          except (AttributeError, KeyError):
+            slot_variable = None
+          if slot_variable is None:
+            continue
+          slot_variable._maybe_initialize_trackable()  # pylint: disable=protected-access
+          if slot_variable._trackable_children():  # pylint: disable=protected-access
+            # TODO(allenl): Gather dependencies of slot variables.
+            raise NotImplementedError(
+                "Currently only variables with no dependencies can be saved as "
+                "slot variables. File a feature request if this limitation "
+                "bothers you.")
+          if slot_variable in node_ids:
+            raise NotImplementedError(
+                "A slot variable was re-used as a dependency of a Trackable "
+                f"object: {slot_variable}. This is not currently allowed. "
+                "File a feature request if this limitation bothers you.")
+          checkpoint_name = trackable_utils.slot_variable_key(
+              variable_path=object_names[original_variable],
+              optimizer_path=object_names[trackable],
+              slot_name=slot_name)
+          object_names[slot_variable] = checkpoint_name
+          slot_variable_node_id = len(trackable_objects)
+          node_ids[slot_variable] = slot_variable_node_id
+          trackable_objects.append(slot_variable)
+          slot_variable_proto = (
+              trackable_object_graph_pb2.TrackableObjectGraph.TrackableObject
+              .SlotVariableReference(
+                  slot_name=slot_name,
+                  original_variable_node_id=original_variable_node_id,
+                  slot_variable_node_id=slot_variable_node_id))
+          slot_variables.setdefault(trackable, []).append(slot_variable_proto)
+  return slot_variables
 
 
-def test_moment_matching(
-    samples,
-    number_moments,
-    dist,
-    stride=0):
-  """Return z-test scores for sample moments to match analytic moments.
+def get_mapped_trackable(trackable, object_map):
+  """Returns the mapped trackable if possible, otherwise returns trackable."""
+  if object_map is None:
+    return trackable
+  else:
+    return object_map.get(trackable, trackable)
 
-  Given `samples`, check that the first sample `number_moments` match
-  the given  `dist` moments by doing a z-test.
+
+def get_full_name(var):
+  """Gets the full name of variable for name-based checkpoint compatibility."""
+  # pylint: disable=protected-access
+  if (not (isinstance(var, variables.Variable) or
+           # Some objects do not subclass Variable but still act as one.
+           resource_variable_ops.is_resource_variable(var))):
+    return ""
+
+  if getattr(var, "_save_slice_info", None) is not None:
+    # Use getattr because `var._save_slice_info` may be set as `None`.
+    return var._save_slice_info.full_name
+  else:
+    return var._shared_name
+  # pylint: enable=protected-access
+
+
+def add_checkpoint_values_check(object_graph_proto):
+  """Determines which objects have checkpoint values and save this to the proto.
 
   Args:
-    samples: Samples from target distribution.
-    number_moments: Python `int` describing how many sample moments to check.
-    dist: SciPy distribution object that provides analytic moments.
-    stride: Distance between samples to check for statistical properties.
-      A stride of 0 means to use all samples, while other strides test for
-      spatial correlation.
-  Returns:
-    Array of z_test scores.
+    object_graph_proto: A `TrackableObjectGraph` proto.
   """
+  # Trackable -> set of all trackables that depend on it (the "parents").
+  # If a trackable has checkpoint values, then all of the parents can be
+  # marked as having checkpoint values.
+  parents = {}
+  checkpointed_trackables = object_identity.ObjectIdentitySet()
 
-  sample_moments = []
-  expected_moments = []
-  variance_sample_moments = []
-  for i in range(1, number_moments + 1):
-    if len(samples.shape) == 2:
-      strided_range = samples.flat[::(i - 1) * stride + 1]
-    else:
-      strided_range = samples[::(i - 1) * stride + 1, ...]
-    sample_moments.append(np.mean(strided_range**i, axis=0))
-    expected_moments.append(dist.moment(i))
-    variance_sample_moments.append(
-        (dist.moment(2 * i) - dist.moment(i) ** 2) / len(strided_range))
+  # First pass: build dictionary of parent objects and initial set of
+  # checkpointed trackables.
+  checkpointed_trackables = set()
+  for node_id, object_proto in enumerate(object_graph_proto.nodes):
+    if (object_proto.attributes or object_proto.slot_variables or
+        object_proto.HasField("registered_saver")):
+      checkpointed_trackables.add(node_id)
+    for child_proto in object_proto.children:
+      child = child_proto.node_id
+      if child not in parents:
+        parents[child] = set()
+      parents[child].add(node_id)
 
-  z_test_scores = []
-  for i in range(1, number_moments + 1):
-    # Assume every operation has a small numerical error.
-    # It takes i multiplications to calculate one i-th moment.
-    total_variance = (
-        variance_sample_moments[i - 1] +
-        i * np.finfo(samples.dtype).eps)
-    tiny = np.finfo(samples.dtype).tiny
-    assert np.all(total_variance > 0)
-    total_variance = np.where(total_variance < tiny, tiny, total_variance)
-    # z_test is approximately a unit normal distribution.
-    z_test_scores.append(abs(
-        (sample_moments[i - 1] - expected_moments[i - 1]) / np.sqrt(
-            total_variance)))
-  return z_test_scores
+  # Second pass: add all connected parents to set of checkpointed trackables.
+  to_visit = set()
+  to_visit.update(checkpointed_trackables)
 
+  while to_visit:
+    trackable = to_visit.pop()
+    if trackable not in parents:
+      # Some trackables may not have parents (e.g. slot variables).
+      continue
+    current_parents = parents.pop(trackable)
+    checkpointed_trackables.update(current_parents)
+    for parent in current_parents:
+      if parent in parents:
+        to_visit.add(parent)
 
-def chi_squared(x, bins):
-  """Pearson's Chi-squared test."""
-  x = np.ravel(x)
-  n = len(x)
-  histogram, _ = np.histogram(x, bins=bins, range=(0, 1))
-  expected = n / float(bins)
-  return np.sum(np.square(histogram - expected) / expected)
-
-
-def normal_cdf(x):
-  """Cumulative distribution function for a standard normal distribution."""
-  return 0.5 + 0.5 * np.vectorize(math.erf)(x / math.sqrt(2))
+  for node_id, object_proto in enumerate(object_graph_proto.nodes):
+    object_proto.has_checkpoint_values.value = bool(
+        node_id in checkpointed_trackables)
 
 
-def anderson_darling(x):
-  """Anderson-Darling test for a standard normal distribution."""
-  x = np.sort(np.ravel(x))
-  n = len(x)
-  i = np.linspace(1, n, n)
-  z = np.sum((2 * i - 1) * np.log(normal_cdf(x)) +
-             (2 * (n - i) + 1) * np.log(1 - normal_cdf(x)))
-  return -n - z / n
+def objects_ids_and_slot_variables_and_paths(graph_view,
+                                             skip_slot_variables=False):
+  """Traverse the object graph and list all accessible objects.
+
+  Looks for `Trackable` objects which are dependencies of
+  `root_trackable`. Includes slot variables only if the variable they are
+  slotting for and the optimizer are dependencies of `root_trackable`
+  (i.e. if they would be saved with a checkpoint).
+
+  Args:
+    graph_view: A GraphView object.
+    skip_slot_variables: If True does not return trackables for slot variable.
+      Default False.
+
+  Returns:
+    A tuple of (trackable objects, paths from root for each object,
+                object -> node id, slot variables, object_names)
+  """
+  trackable_objects, node_paths = graph_view.breadth_first_traversal()
+  object_names = object_identity.ObjectIdentityDictionary()
+  for obj, path in node_paths.items():
+    object_names[obj] = trackable_utils.object_path_to_string(path)
+  node_ids = object_identity.ObjectIdentityDictionary()
+  for node_id, node in enumerate(trackable_objects):
+    node_ids[node] = node_id
+  if skip_slot_variables:
+    slot_variables = object_identity.ObjectIdentityDictionary()
+  else:
+    slot_variables = serialize_slot_variables(
+        trackable_objects=trackable_objects,
+        node_ids=node_ids,
+        object_names=object_names,
+    )
+  return (trackable_objects, node_paths, node_ids, slot_variables, object_names)
 
 
-def test_truncated_normal(assert_equal,
-                          assert_all_close,
-                          n,
-                          y,
-                          means=None,
-                          stddevs=None,
-                          minvals=None,
-                          maxvals=None,
-                          mean_atol=5e-4,
-                          median_atol=8e-4,
-                          variance_rtol=1e-3):
-  """Tests truncated normal distribution's statistics."""
-  def _normal_cdf(x):
-    return .5 * math.erfc(-x / math.sqrt(2))
-
-  def normal_pdf(x):
-    return math.exp(-(x**2) / 2.) / math.sqrt(2 * math.pi)
-
-  def probit(x):
-    return special_math.ndtri(x)
-
-  a = -2.
-  b = 2.
-  mu = 0.
-  sigma = 1.
-
-  if minvals is not None:
-    a = minvals
-
-  if maxvals is not None:
-    b = maxvals
-
-  if means is not None:
-    mu = means
-
-  if stddevs is not None:
-    sigma = stddevs
-
-  alpha = (a - mu) / sigma
-  beta = (b - mu) / sigma
-  z = _normal_cdf(beta) - _normal_cdf(alpha)
-
-  assert_equal((y >= a).sum(), n)
-  assert_equal((y <= b).sum(), n)
-
-  # For more information on these calculations, see:
-  # Burkardt, John. "The Truncated Normal Distribution".
-  # Department of Scientific Computing website. Florida State University.
-  expected_mean = mu + (normal_pdf(alpha) - normal_pdf(beta)) / z * sigma
-  y = y.astype(float)
-  actual_mean = np.mean(y)
-  assert_all_close(actual_mean, expected_mean, atol=mean_atol)
-
-  expected_median = mu + probit(
-      (_normal_cdf(alpha) + _normal_cdf(beta)) / 2.) * sigma
-  actual_median = np.median(y)
-  assert_all_close(actual_median, expected_median, atol=median_atol)
-
-  expected_variance = sigma**2 * (1 + (
-      (alpha * normal_pdf(alpha) - beta * normal_pdf(beta)) / z) - (
-          (normal_pdf(alpha) - normal_pdf(beta)) / z)**2)
-  actual_variance = np.var(y)
-  assert_all_close(
-      actual_variance,
-      expected_variance,
-      rtol=variance_rtol)
+def list_objects(graph_view, skip_slot_variables=False):
+  """Traverse the object graph and list all accessible objects."""
+  trackable_objects = objects_ids_and_slot_variables_and_paths(
+      graph_view, skip_slot_variables
+  )[0]
+  return trackable_objects

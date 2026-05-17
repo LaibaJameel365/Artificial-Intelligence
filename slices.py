@@ -1,4 +1,4 @@
-# Copyright 2018 The TensorFlow Authors. All Rights Reserved.
+# Copyright 2016 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,131 +12,72 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Operators specific to slicing operations."""
+"""Converter for slice operations."""
 
-import collections
+import gast
 
-from tensorflow.python.framework import dtypes
-from tensorflow.python.framework import tensor_util
-from tensorflow.python.ops import gen_array_ops
-from tensorflow.python.ops import gen_string_ops
-from tensorflow.python.ops import list_ops
-from tensorflow.python.ops import tensor_array_ops
+from tensorflow.python.autograph.core import converter
+from tensorflow.python.autograph.lang import directives
+from tensorflow.python.autograph.pyct import templates
 
 
-# TODO(mdan): Support extended slices.
+class SliceTransformer(converter.Base):
+  """Converts slicing operations to their TF counterpart.
 
-
-class GetItemOpts(collections.namedtuple('GetItemOpts', ('element_dtype',))):
-  pass
-
-
-def get_item(target, i, opts):
-  """The slice read operator (i.e. __getitem__).
-
-  Note: it is unspecified whether target will be mutated or not. In general,
-  if target is mutable (like Python lists), it will be mutated.
-
-  Args:
-    target: An entity that supports getitem semantics.
-    i: Index to read from.
-    opts: A GetItemOpts object.
-
-  Returns:
-    The read element.
-
-  Raises:
-    ValueError: if target is not of a supported type.
+  Currently, relying on the default slice operator that Tensor uses is
+  insufficient, because TensorArray and tensor lists use dedicated index read
+  and write functions.
   """
-  assert isinstance(opts, GetItemOpts)
 
-  if isinstance(target, tensor_array_ops.TensorArray):
-    return _tf_tensorarray_get_item(target, i)
-  elif tensor_util.is_tf_type(target):
-    if target.dtype == dtypes.variant:
-      return _tf_tensor_list_get_item(target, i, opts)
-    elif target.dtype == dtypes.string and target.shape.ndims == 0:
-      return _tf_tensor_string_get_item(target, i)
-    else:
-      return _tf_tensor_get_item(target, i)
-  else:
-    return _py_get_item(target, i)
+  def _process_single_assignment(self, target, value):
+    if not isinstance(target, gast.Subscript):
+      return None
+    s = target.slice
+    if isinstance(s, (gast.Tuple, gast.Slice)):
+      return None
 
+    template = """
+      target = ag__.set_item(target, key, item)
+    """
+    return templates.replace(
+        template, target=target.value, key=target.slice, item=value)
 
-def _tf_tensorarray_get_item(target, i):
-  """Overload of get_item that stages a TensorArray read."""
-  return target.read(i)
+  def visit_Assign(self, node):
+    node = self.generic_visit(node)
+    # TODO(mdan): Support unpackings and multiple assignments.
+    if len(node.targets) != 1:
+      raise NotImplementedError('multiple assignment')
+    replacement = self._process_single_assignment(node.targets[0], node.value)
+    if replacement is not None:
+      return replacement
+    return node
 
+  def visit_Subscript(self, node):
+    node = self.generic_visit(node)
+    s = node.slice
+    if isinstance(s, (gast.Tuple, gast.Slice)):
+      return node
 
-def _tf_tensor_list_get_item(target, i, opts):
-  """Overload of get_item that stages a Tensor list read."""
-  if opts.element_dtype is None:
-    raise ValueError('cannot retrieve from a list without knowing its '
-                     'element type; use set_element_type to annotate it')
-  x = list_ops.tensor_list_get_item(target, i, element_dtype=opts.element_dtype)
-  return x
+    if not isinstance(node.ctx, gast.Load):
+      # Index writes are handled at a higher level, one at which the rvalue is
+      # also available.
+      return node
 
+    dtype = self.get_definition_directive(
+        node.value,
+        directives.set_element_type,
+        'dtype',
+        default=templates.replace_as_expression('None'))
 
-def _tf_tensor_get_item(target, i):
-  """Overload of get_item that stages a Tensor (not Tensor list) read."""
-  return target[i]
-
-
-def _tf_tensor_string_get_item(target, i):
-  """Overload of get_item that stages a Tensor string read."""
-  x = gen_string_ops.substr(target, i, 1)
-  return x
-
-
-def _py_get_item(target, i):
-  """Overload of get_item that executes a Python list modification."""
-  return target[i]
-
-
-def set_item(target, i, x):
-  """The slice write operator (i.e. __setitem__).
-
-  Note: it is unspecified whether target will be mutated or not. In general,
-  if target is mutable (like Python lists), it will be mutated.
-
-  Args:
-    target: An entity that supports setitem semantics.
-    i: Index to modify.
-    x: The new element value.
-
-  Returns:
-    Same as target, after the update was performed.
-
-  Raises:
-    ValueError: if target is not of a supported type.
-  """
-  if isinstance(target, tensor_array_ops.TensorArray):
-    return _tf_tensorarray_set_item(target, i, x)
-  elif tensor_util.is_tf_type(target):
-    if target.dtype == dtypes.variant:
-      return _tf_tensor_list_set_item(target, i, x)
-    else:
-      return _tf_tensor_set_item(target, i, x)
-  else:
-    return _py_set_item(target, i, x)
+    template = """
+      ag__.get_item(
+          target,
+          key,
+          opts=ag__.GetItemOpts(element_dtype=dtype))
+    """
+    return templates.replace_as_expression(
+        template, target=node.value, key=s, dtype=dtype)
 
 
-def _tf_tensorarray_set_item(target, i, x):
-  """Overload of set_item that stages a TensorArray write."""
-  return target.write(i, x)
-
-
-def _tf_tensor_list_set_item(target, i, x):
-  """Overload of set_item that stages a Tensor list update."""
-  return list_ops.tensor_list_set_item(target, i, x)
-
-
-def _tf_tensor_set_item(target, i, x):
-  """Overload of set_item that stages a Tensor scatter update."""
-  return gen_array_ops.tensor_scatter_update(target, ((i,),), (x,))
-
-
-def _py_set_item(target, i, x):
-  """Overload of set_item that executes a Python list modification."""
-  target[i] = x
-  return target
+def transform(node, ctx):
+  return SliceTransformer(ctx).visit(node)

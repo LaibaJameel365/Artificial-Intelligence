@@ -1,4 +1,4 @@
-# Copyright 2017 The TensorFlow Authors. All Rights Reserved.
+# Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,83 +12,166 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Directives are special no-op functions that serve as compilation markers.
+"""Handles directives.
 
-They provide static information like type hints, compilation and TensorFlow
-overrides.
+This converter removes the directive functions from the code and moves the
+information they specify into AST annotations. It is a specialized form of
+static analysis, one that is specific to AutoGraph.
 
-These serve as annotations in the compiled code, allowing the user some control
-over the compilation process. They have no functional role at runtime.
+Note that this requires that the actual directive functions are static - that
+is, they do not change at runtime. So if you do something like this:
+
+  tf.autograph.set_loop_options = <new function>
+
+Then the directive will may no longer be recognized. Furthermore, if the
+converted function is cached, such an action may be irreversible.
 """
 
-from tensorflow.python.util.tf_export import tf_export
+import inspect
 
-UNSPECIFIED = object()
+import gast
 
-
-def set_element_type(entity, dtype, shape=UNSPECIFIED):
-  """Indicates that the entity is expected hold items of specified type/shape.
-
-  The staged TensorFlow ops will reflect and assert this data type. Ignored
-  otherwise.
-
-  Args:
-    entity: The entity to annotate.
-    dtype: TensorFlow dtype value to assert for entity.
-    shape: Optional shape to assert for entity.
-  """
-  del entity
-  del dtype
-  del shape
+from tensorflow.python.autograph.core import converter
+from tensorflow.python.autograph.lang import directives
+from tensorflow.python.autograph.pyct import anno
+from tensorflow.python.util import tf_inspect
 
 
-@tf_export('autograph.experimental.set_loop_options')
-def set_loop_options(
-    parallel_iterations=UNSPECIFIED,
-    swap_memory=UNSPECIFIED,
-    maximum_iterations=UNSPECIFIED,
-    shape_invariants=UNSPECIFIED):
-  """Specifies additional arguments to be passed to the enclosing while_loop.
+STATIC_VALUE = 'static_value'
+"""Used for AST annotations, see visit_Name."""
 
-  The parameters apply to and only to the immediately enclosing loop. It only
-  has effect if the loop is staged as a TF while_loop; otherwise the parameters
-  have no effect.
 
-  Usage:
+class _LoopScope(object):
 
-    >>> @tf.function(autograph=True)
-    ... def f():
-    ...   n = 0
-    ...   for i in tf.range(10):
-    ...     tf.autograph.experimental.set_loop_options(maximum_iterations=3)
-    ...     n += 1
-    ...   return n
+  def __init__(self):
+    self.ast_node = None
+    self.statements_visited = 0
 
-    >>> @tf.function(autograph=True)
-    ... def f():
-    ...   v = tf.constant((0,))
-    ...   for i in tf.range(3):
-    ...     tf.autograph.experimental.set_loop_options(
-    ...         shape_invariants=[(v, tf.TensorShape([None]))]
-    ...     )
-    ...     v = tf.concat((v, [i]), 0)
-    ...   return v
 
-  Also see tf.while_loop.
+def _map_args(call_node, function):
+  """Maps AST call nodes to the actual function's arguments.
 
   Args:
-    parallel_iterations: The maximum number of iterations allowed to run in
-        parallel at any given time. Note that this does not guarantee parallel
-        execution.
-    swap_memory: Whether to store intermediate values needed for
-        gradients on the CPU instead of GPU.
-    maximum_iterations: Allows limiting the total number of iterations executed
-        by the loop.
-    shape_invariants: Allows controlling the argument with the same name passed
-        to tf.while_loop. Unlike tf.while_loop, this is a list of
-        `(tensor, shape)` pairs.
+    call_node: ast.Call
+    function: Callable[..., Any], the actual function matching call_node
+  Returns:
+    Dict[Text, ast.AST], mapping each of the function's argument names to
+    the respective AST node.
+  Raises:
+      ValueError: if the default arguments are not correctly set
   """
-  del parallel_iterations
-  del swap_memory
-  del maximum_iterations
-  del shape_invariants
+  args = call_node.args
+  kwds = {kwd.arg: kwd.value for kwd in call_node.keywords}
+  call_args = tf_inspect.getcallargs(function, *args, **kwds)
+
+  # Keyword arguments not specified in kwds will be mapped to their defaults,
+  # which are Python values. Since we don't currently have a way to transform
+  # those into AST references, we simply remove them. By convention, directives
+  # use UNSPECIFIED as default value for optional arguments. No other
+  # defaults should be present.
+  unexpected_defaults = []
+  for k in call_args:
+    if (k not in kwds
+        and call_args[k] not in args
+        and call_args[k] is not directives.UNSPECIFIED):
+      unexpected_defaults.append(k)
+  if unexpected_defaults:
+    raise ValueError('Unexpected keyword argument values, %s, for function %s'
+                     % (zip(unexpected_defaults,
+                            [call_args[k] for k in unexpected_defaults]),
+                        function))
+  return {k: v for k, v in call_args.items() if v is not directives.UNSPECIFIED}
+
+
+class DirectivesTransformer(converter.Base):
+  """Parses compiler directives and converts them into AST annotations."""
+
+  def _process_symbol_directive(self, call_node, directive):
+    if len(call_node.args) < 1:
+      raise ValueError('"%s" requires a positional first argument'
+                       ' as the target' % directive.__name__)
+    target = call_node.args[0]
+    defs = anno.getanno(target, anno.Static.ORIG_DEFINITIONS)
+    for def_ in defs:
+      def_.directives[directive] = _map_args(call_node, directive)
+    return call_node
+
+  def _process_statement_directive(self, call_node, directive):
+    if self.state[_LoopScope].statements_visited > 1:
+      raise ValueError(
+          '"%s" must be the first statement in the loop block' % (
+              directive.__name__))
+    if self.state[_LoopScope].level < 2:
+      raise ValueError(
+          '"%s" must be used inside a statement' % directive.__name__)
+    target = self.state[_LoopScope].ast_node
+    node_anno = anno.getanno(target, anno.Basic.DIRECTIVES, {})
+    node_anno[directive] = _map_args(call_node, directive)
+    anno.setanno(target, anno.Basic.DIRECTIVES, node_anno)
+    return call_node
+
+  def visit_Name(self, node):
+    node = self.generic_visit(node)
+    if isinstance(node.ctx, gast.Load):
+      defs = anno.getanno(node, anno.Static.DEFINITIONS, ())
+      is_defined = bool(defs)
+      if not is_defined and node.id in self.ctx.info.namespace:
+        anno.setanno(node, STATIC_VALUE, self.ctx.info.namespace[node.id])
+    return node
+
+  def visit_Attribute(self, node):
+    node = self.generic_visit(node)
+    parent_val = anno.getanno(node.value, STATIC_VALUE, default=None)
+    if parent_val is not None and inspect.ismodule(parent_val):
+      if hasattr(parent_val, node.attr):
+        anno.setanno(node, STATIC_VALUE, getattr(parent_val, node.attr))
+    return node
+
+  def visit_Assign(self, node):
+    self.state[_LoopScope].statements_visited += 1
+    return self.generic_visit(node)
+
+  def visit_AugAssign(self, node):
+    self.state[_LoopScope].statements_visited += 1
+    return self.generic_visit(node)
+
+  def visit_Expr(self, node):
+    self.state[_LoopScope].statements_visited += 1
+    node = self.generic_visit(node)
+    if isinstance(node.value, gast.Call):
+      call_node = node.value
+      static_val = anno.getanno(call_node.func, STATIC_VALUE, default=None)
+      if static_val is not None:
+        # Note: directive calls are not output in the generated code, hence
+        # the removal from the code by returning None.
+
+        if static_val is directives.set_element_type:
+          self._process_symbol_directive(call_node, static_val)
+          return None
+        elif static_val is directives.set_loop_options:
+          self._process_statement_directive(call_node, static_val)
+          return None
+    return node
+
+  # TODO(mdan): This will be insufficient for other control flow.
+  # That means that if we ever have a directive that affects things other than
+  # loops, we'll need support for parallel scopes, or have multiple converters.
+  def _track_and_visit_loop(self, node):
+    self.state[_LoopScope].enter()
+    self.state[_LoopScope].ast_node = node
+    node = self.generic_visit(node)
+    # Edge case: a loop with just one directive statement would become empty.
+    if not node.body:
+      node.body = [gast.Pass()]
+    self.state[_LoopScope].exit()
+    return node
+
+  def visit_While(self, node):
+    return self._track_and_visit_loop(node)
+
+  def visit_For(self, node):
+    return self._track_and_visit_loop(node)
+
+
+def transform(node, ctx):
+  return DirectivesTransformer(ctx).visit(node)

@@ -1,4 +1,4 @@
-# Copyright 2019 The TensorFlow Authors. All Rights Reserved.
+# Copyright 2020 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,93 +12,86 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Utilities used to capture Python idioms."""
+"""Overloads all variable read operations."""
+
+import gast
+
+from tensorflow.python.autograph.core import converter
+from tensorflow.python.autograph.pyct import anno
+from tensorflow.python.autograph.pyct import templates
 
 
-def ld(v):
-  """Load variable operator."""
-  if isinstance(v, Undefined):
-    return v.read()
-  return v
+class VariableAccessTransformer(converter.Base):
+  """Rewrites basic symbol reads.
 
+  This transformer rewrites variable reads with a "read" operator which allows
+  tracking activity.
 
-def ldu(load_v, name):
-  """Load variable operator that returns Undefined when failing to evaluate.
-
-  Note: the name ("load or return undefined") is abbreviated to minimize
-  the amount of clutter in generated code.
-
-  This variant of `ld` is useful when loading symbols that may be undefined at
-  runtime, such as composite symbols, and whether they are defined or not cannot
-  be determined statically. For example `d['a']` is undefined when `d` is an
-  empty dict.
-
-  Args:
-    load_v: Lambda that executes the actual read.
-    name: Human-readable name of the symbol being read.
-  Returns:
-    Either the value of the symbol, or Undefined, if the symbol is not fully
-    defined.
-  """
-  try:
-    # TODO(mdan): Use locals()/globals() here.
-    return load_v()
-  except (KeyError, AttributeError, NameError):
-    return Undefined(name)
-
-
-class Undefined(object):
-  """Represents an undefined symbol in Python.
-
-  This is used to reify undefined symbols, which is required to use the
-  functional form of loops.
   Example:
 
-    while n > 0:
-      n = n - 1
-      s = n
-    return s  # Runtime error if n == 0
+  For a basic statement:
 
-  This is valid Python code and will not result in an error as long as n
-  is positive. The use of this class is to stay as close to Python semantics
-  as possible for staged code of this nature.
+      a = b + c
 
-  Converted version of the above showing the possible usage of this class:
+  This is translated to:
 
-    s = Undefined('s')
-    init_state = (s,)
-    s = while_loop(cond, body, init_state)
-    return s  # s is an instance of Undefined if the loop never runs
+      a = ld(b) + ld(c)
 
-  Attributes:
-    symbol_name: Text, identifier for the undefined symbol
+  Augmented assignment operations also introduce a `ld` operator:
+
+      a += b
+
+  The assignment target also receives an operator to properly represent the
+  read:
+
+      a = ld(a)
+      a += ld(b)
   """
 
-  __slots__ = ('symbol_name',)
+  def visit_Name(self, node):
+    # Only the loads which existed in the original code are overloaded.
+    if not anno.hasanno(node, anno.Static.ORIG_DEFINITIONS):
+      return node
+    if isinstance(node.ctx, gast.Load):
+      node = templates.replace_as_expression('ag__.ld(var_)', var_=node)
+    return node
 
-  def __init__(self, symbol_name):
-    self.symbol_name = symbol_name
+  def visit_Delete(self, node):
+    node = self.generic_visit(node)
 
-  def read(self):
-    raise UnboundLocalError("'{}' is used before assignment".format(
-        self.symbol_name))
+    rewrite_targets = []
+    for tgt in node.targets:
+      # Don't rewrite composites like `del a[0]`.
+      if isinstance(tgt, gast.Name):
+        rewrite_targets.append(tgt)
 
-  def __repr__(self):
-    return self.symbol_name
+    if not rewrite_targets:
+      return node
 
-  def __getattribute__(self, name):
-    try:
-      # If it's an existing attribute, return it.
-      return object.__getattribute__(self, name)
-    except AttributeError:
-      # Otherwise return Undefined.
-      return self
+    results = []
+    for tgt in rewrite_targets:
+      template = """
+        var_ = ag__.Undefined(var_name)
+      """
+      results.extend(templates.replace(
+          template, var_=tgt, var_name=gast.Constant(tgt.id, kind=None)))
+    remaining_targets = [n for n in node.targets if n not in rewrite_targets]
+    if remaining_targets:
+      results.append(gast.Delete(targets=remaining_targets))
 
-  def __getitem__(self, i):
-    return self
+    return results
+
+  def visit_AugAssign(self, node):
+    if isinstance(node.target, gast.Name):
+      template = """
+        var_ = ag__.ld(var_)
+        original
+      """
+      node = templates.replace(template, var_=node.target, original=node)
+    else:
+      node = self.generic_visit(node)
+    return node
 
 
-# TODO(mdan): Refactor as a RetVal object, aggregating the value and do_return.
-class UndefinedReturnValue(object):
-  """Represents a return value that is undefined."""
-  pass
+def transform(node, ctx):
+  return VariableAccessTransformer(ctx).visit(node)

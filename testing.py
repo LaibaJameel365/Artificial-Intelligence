@@ -1,4 +1,4 @@
-# Copyright 2018 The TensorFlow Authors. All Rights Reserved.
+# Copyright 2017 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,187 +12,157 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Experimental API for testing of tf.data."""
-from google.protobuf import text_format
-from tensorflow.core.framework import attr_value_pb2
-from tensorflow.python.data.ops import dataset_ops
-from tensorflow.python.framework import dtypes
+"""Testing utilities."""
+
+import re
+import sys
+import types
+import unittest
+
+from tensorflow.python.eager import def_function
+from tensorflow.python.framework import op_callbacks
 from tensorflow.python.framework import ops
-from tensorflow.python.ops import gen_experimental_dataset_ops
+from tensorflow.python.ops import variables
+from tensorflow.python.platform import test
 
 
-def assert_next(transformations):
-  """A transformation that asserts which transformations happen next.
+class AutoGraphTestCase(test.TestCase):
+  """Tests specialized for AutoGraph, which run as tf.functions.
 
-  Transformations should be referred to by their base name, not including
-  version suffix. For example, use "Batch" instead of "BatchV2". "Batch" will
-  match any of "Batch", "BatchV1", "BatchV2", etc.
+  These tests use a staged programming-like approach: most of the test code runs
+  as-is inside a tf.function, but the assertions are lifted outside the
+  function, and run with the corresponding function values instead.
 
-  Args:
-    transformations: A `tf.string` vector `tf.Tensor` identifying the
-      transformations that are expected to happen next.
+  For example, the test:
 
-  Returns:
-    A `Dataset` transformation function, which can be passed to
-    `tf.data.Dataset.apply`.
+      def test_foo(self):
+        baz = bar();
+        self.assertEqual(baz, value)
+
+  is equivalent to writing:
+
+      def test_foo(self):
+        @tf.function
+        def test_fn():
+          baz = bar();
+          return baz, value
+
+        baz_actual, value_actual = test_fn()
+        self.assertEqual(baz_actual, value_actual)
+
+  Only assertions that require evaluation outside the function are lifted
+  outside the function scope. The rest execute inline, at function creation
+  time.
   """
 
-  def _apply_fn(dataset):
-    """Function from `Dataset` to `Dataset` that applies the transformation."""
-    return _AssertNextDataset(dataset, transformations)
+  def __new__(cls, *args):
+    obj = super().__new__(cls)
 
-  return _apply_fn
+    for name in cls.__dict__:
+      if not name.startswith(unittest.TestLoader.testMethodPrefix):
+        continue
+      m = getattr(obj, name)
+      if callable(m):
+        wrapper = obj._run_as_tf_function(m)
+        setattr(obj, name, types.MethodType(wrapper, obj))
 
+    return obj
 
-def assert_prev(transformations):
-  r"""Asserts which transformations, with which attributes, happened previously.
+  def _op_callback(
+      self, op_type, inputs, attrs, outputs, op_name=None, graph=None):
+    self.trace_log.append(op_type)
 
-    Each transformation is represented as a tuple in the input.
+  def _run_as_tf_function(self, fn):
 
-    The first element is the base op name of the transformation, not including
-    version suffix.  For example, use "BatchDataset" instead of
-    "BatchDatasetV2".  "BatchDataset" will match any of "BatchDataset",
-    "BatchDatasetV1", "BatchDatasetV2", etc.
+    def wrapper(self):
+      @def_function.function(autograph=False)  # Testing autograph itself.
+      def fn_wrapper():
+        self.assertions = []
+        self.raises_cm = None
+        self.graph_assertions = []
+        self.trace_log = []
+        fn()
+        targets = [args for _, args in self.assertions]
+        return targets
 
-    The second element is a dict of attribute name-value pairs.  Attributes
-    values must be of type bool, int, or string.
+      try:
+        tensors = fn_wrapper()
 
-    Example usage:
+        for assertion in self.graph_assertions:
+          assertion(fn_wrapper.get_concrete_function().graph)
 
-    >>> dataset_ops.Dataset.from_tensors(0) \
-    ... .map(lambda x: x) \
-    ... .batch(1, deterministic=True, num_parallel_calls=8) \
-    ... .assert_prev([("ParallelBatchDataset", {"deterministic": True}), \
-    ...               ("MapDataset", {})])
+        actuals = self.evaluate(tensors)
 
-  Args:
-    transformations: A list of tuples identifying the (required) transformation
-      name, with (optional) attribute name-value pairs, that are expected to
-      have happened previously.
-
-  Returns:
-    A `Dataset` transformation function, which can be passed to
-    `tf.data.Dataset.apply`.
-  """
-
-  def _apply_fn(dataset):
-    """Function from `Dataset` to `Dataset` that applies the transformation."""
-    return _AssertPrevDataset(dataset, transformations)
-
-  return _apply_fn
-
-
-def non_serializable():
-  """A non-serializable identity transformation.
-
-  Returns:
-    A `Dataset` transformation function, which can be passed to
-    `tf.data.Dataset.apply`.
-  """
-
-  def _apply_fn(dataset):
-    """Function from `Dataset` to `Dataset` that applies the transformation."""
-    return _NonSerializableDataset(dataset)
-
-  return _apply_fn
-
-
-def sleep(sleep_microseconds):
-  """Sleeps for `sleep_microseconds` before producing each input element.
-
-  Args:
-    sleep_microseconds: The number of microseconds to sleep before producing an
-      input element.
-
-  Returns:
-    A `Dataset` transformation function, which can be passed to
-    `tf.data.Dataset.apply`.
-  """
-
-  def _apply_fn(dataset):
-    return _SleepDataset(dataset, sleep_microseconds)
-
-  return _apply_fn
-
-
-class _AssertNextDataset(dataset_ops.UnaryUnchangedStructureDataset):
-  """A `Dataset` that asserts which transformations happen next."""
-
-  def __init__(self, input_dataset, transformations):
-    """See `assert_next()` for details."""
-    self._input_dataset = input_dataset
-    if transformations is None:
-      raise ValueError(
-          "Invalid `transformations`. `transformations` should not be empty.")
-
-    self._transformations = ops.convert_to_tensor(
-        transformations, dtype=dtypes.string, name="transformations")
-    variant_tensor = (
-        gen_experimental_dataset_ops.experimental_assert_next_dataset(
-            self._input_dataset._variant_tensor,  # pylint: disable=protected-access
-            self._transformations,
-            **self._flat_structure))
-    super(_AssertNextDataset, self).__init__(input_dataset, variant_tensor)
-
-
-class _AssertPrevDataset(dataset_ops.UnaryUnchangedStructureDataset):
-  """A `Dataset` that asserts which transformations happened previously."""
-
-  def __init__(self, input_dataset, transformations):
-    """See `assert_prev()` for details."""
-    self._input_dataset = input_dataset
-    if transformations is None:
-      raise ValueError("`transformations` cannot be empty")
-
-    def serialize_transformation(op_name, attributes):
-      proto = attr_value_pb2.NameAttrList(name=op_name)
-      if attributes is None or isinstance(attributes, set):
-        attributes = dict()
-      for (name, value) in attributes.items():
-        if isinstance(value, bool):
-          proto.attr[name].b = value
-        elif isinstance(value, int):
-          proto.attr[name].i = value
-        elif isinstance(value, str):
-          proto.attr[name].s = value.encode()
+      except:  # pylint:disable=bare-except
+        if self.raises_cm is not None:
+          # Note: Yes, the Raises and function contexts cross.
+          self.raises_cm.__exit__(*sys.exc_info())
+          return
         else:
-          raise ValueError(
-              f"attribute value type ({type(value)}) must be bool, int, or str")
-      return text_format.MessageToString(proto)
+          raise
 
-    self._transformations = ops.convert_to_tensor(
-        [serialize_transformation(*x) for x in transformations],
-        dtype=dtypes.string,
-        name="transformations")
-    variant_tensor = (
-        gen_experimental_dataset_ops.assert_prev_dataset(
-            self._input_dataset._variant_tensor,  # pylint: disable=protected-access
-            self._transformations,
-            **self._flat_structure))
-    super(_AssertPrevDataset, self).__init__(input_dataset, variant_tensor)
+      for (assertion, _), values in zip(self.assertions, actuals):
+        assertion(*values)
 
+    return wrapper
 
-class _NonSerializableDataset(dataset_ops.UnaryUnchangedStructureDataset):
-  """A `Dataset` that performs non-serializable identity transformation."""
+  def variable(self, name, value, dtype):
+    with ops.init_scope():
+      if name not in self.variables:
+        self.variables[name] = variables.Variable(value, dtype=dtype)
+        self.evaluate(self.variables[name].initializer)
+    return self.variables[name]
 
-  def __init__(self, input_dataset):
-    """See `non_serializable()` for details."""
-    self._input_dataset = input_dataset
-    variant_tensor = (
-        gen_experimental_dataset_ops.experimental_non_serializable_dataset(
-            self._input_dataset._variant_tensor,  # pylint: disable=protected-access
-            **self._flat_structure))
-    super(_NonSerializableDataset, self).__init__(input_dataset, variant_tensor)
+  def setUp(self):
+    super().setUp()
+    self.variables = {}
+    self.trace_log = []
+    self.raises_cm = None
+    op_callbacks.add_op_callback(self._op_callback)
 
+  def tearDown(self):
+    op_callbacks.remove_op_callback(self._op_callback)
+    self.trace_log = None
+    self.variables = None
+    super().tearDown()
 
-class _SleepDataset(dataset_ops.UnaryUnchangedStructureDataset):
-  """A `Dataset` that sleeps before producing each upstream element."""
+  def assertGraphContains(self, op_regex, n):
+    def assertion(graph):
+      matches = []
+      for node in graph.as_graph_def().node:
+        if re.match(op_regex, node.name):
+          matches.append(node)
+      for fn in graph.as_graph_def().library.function:
+        for node_def in fn.node_def:
+          if re.match(op_regex, node_def.name):
+            matches.append(node_def)
+      self.assertLen(matches, n)
 
-  def __init__(self, input_dataset, sleep_microseconds):
-    self._input_dataset = input_dataset
-    self._sleep_microseconds = sleep_microseconds
-    variant_tensor = gen_experimental_dataset_ops.sleep_dataset(
-        self._input_dataset._variant_tensor,  # pylint: disable=protected-access
-        self._sleep_microseconds,
-        **self._flat_structure)
-    super(_SleepDataset, self).__init__(input_dataset, variant_tensor)
+    self.graph_assertions.append(assertion)
+
+  def assertOpCreated(self, op_type):
+    self.assertIn(op_type, self.trace_log)
+
+  def assertOpsNotCreated(self, op_types):
+    self.assertEmpty(set(op_types) & set(self.trace_log))
+
+  def assertNoOpsCreated(self):
+    self.assertEmpty(self.trace_log)
+
+  def assertEqual(self, *args):
+    self.assertions.append((super().assertEqual, list(args)))
+
+  def assertLess(self, *args):
+    self.assertions.append((super().assertLess, list(args)))
+
+  def assertGreaterEqual(self, *args):
+    self.assertions.append((super().assertGreaterEqual, list(args)))
+
+  def assertDictEqual(self, *args):
+    self.assertions.append((super().assertDictEqual, list(args)))
+
+  def assertRaisesRuntime(self, *args):
+    if self.raises_cm is not None:
+      raise ValueError('cannot use more than one assertRaisesRuntime in a test')
+    self.raises_cm = self.assertRaisesRegex(*args)
+    self.raises_cm.__enter__()
