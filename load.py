@@ -12,1134 +12,1194 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Import a trackable object from a SavedModel."""
+"""Keras SavedModel deserialization."""
 
-import collections
-import functools
 import os
-import sys
+import re
+import types
 
-from absl import logging
+from google.protobuf import message
 
-from tensorflow.core.framework import graph_debug_info_pb2
-from tensorflow.core.function.capture import restore_captures
-from tensorflow.python.checkpoint import checkpoint
-from tensorflow.python.checkpoint import checkpoint_options
-from tensorflow.python.checkpoint import graph_view
-from tensorflow.python.checkpoint import restore
-from tensorflow.python.distribute import distribute_lib
-from tensorflow.python.distribute import distribute_utils
-from tensorflow.python.distribute import values_util
 from tensorflow.python.eager import context
-from tensorflow.python.eager import function
-from tensorflow.python.eager.polymorphic_function import saved_model_utils as function_saved_model_utils
-from tensorflow.python.framework import config
-from tensorflow.python.framework import constant_op
-from tensorflow.python.framework import dtypes
-from tensorflow.python.framework import errors
 from tensorflow.python.framework import ops
-from tensorflow.python.ops import array_ops
-from tensorflow.python.ops import control_flow_assert
-from tensorflow.python.ops import control_flow_ops
-from tensorflow.python.ops import lookup_ops
-from tensorflow.python.ops import resource_variable_ops
-from tensorflow.python.ops import variables
-from tensorflow.python.saved_model import fingerprinting
-from tensorflow.python.saved_model import fingerprinting_utils
-from tensorflow.python.saved_model import function_deserialization
-from tensorflow.python.saved_model import load_options
-from tensorflow.python.saved_model import load_v1_in_v2
+from tensorflow.python.framework import sparse_tensor
+from tensorflow.python.framework import tensor_shape
+from tensorflow.python.framework import tensor_spec
+from tensorflow.python.keras import backend
+from tensorflow.python.keras import regularizers
+from tensorflow.python.keras.engine import input_spec
+from tensorflow.python.keras.optimizer_v2 import optimizer_v2
+from tensorflow.python.keras.protobuf import saved_metadata_pb2
+from tensorflow.python.keras.protobuf import versions_pb2
+from tensorflow.python.keras.saving import saving_utils
+from tensorflow.python.keras.saving.saved_model import constants
+from tensorflow.python.keras.saving.saved_model import json_utils
+from tensorflow.python.keras.saving.saved_model import utils
+from tensorflow.python.keras.saving.saved_model.serialized_attributes import CommonEndpoints
+from tensorflow.python.keras.utils import generic_utils
+from tensorflow.python.keras.utils import metrics_utils
+from tensorflow.python.keras.utils.generic_utils import LazyLoader
+from tensorflow.python.ops.ragged import ragged_tensor
+from tensorflow.python.platform import gfile
+from tensorflow.python.platform import tf_logging as logging
+from tensorflow.python.saved_model import load as tf_load
 from tensorflow.python.saved_model import loader_impl
-from tensorflow.python.saved_model import path_helpers
-from tensorflow.python.saved_model import registration
+from tensorflow.python.saved_model import nested_structure_coder
 from tensorflow.python.saved_model import revived_types
-from tensorflow.python.saved_model import utils_impl as saved_model_utils
-from tensorflow.python.saved_model.pywrap_saved_model import metrics
-from tensorflow.python.trackable import asset
-from tensorflow.python.trackable import autotrackable
-from tensorflow.python.trackable import base
+from tensorflow.python.trackable import base as trackable
 from tensorflow.python.trackable import data_structures
-from tensorflow.python.trackable import resource
-from tensorflow.python.trackable import trackable_utils
-from tensorflow.python.training import py_checkpoint_reader
-from tensorflow.python.training.saving import saveable_object_util
+from tensorflow.python.util import compat
 from tensorflow.python.util import nest
-from tensorflow.python.util.tf_export import tf_export
 
-# API label for SavedModel metrics.
-_LOAD_V2_LABEL = "load_v2"
-# Built-in registrations use the "oneof kind" field in the SavedObject proto,
-# instead of "registered_name" field. The "kind" field has almost the same
-# functionality as the registered_name, but only contains built-in TensorFlow
-# types (like variable, functions, assets).
-_BUILT_IN_REGISTRATIONS = {
-    "asset": asset.Asset,
-    "resource": resource.RestoredResource,
-    "constant": function_saved_model_utils.TrackableConstant}
+# To avoid circular dependencies between keras/engine and keras/saving,
+# code in keras/saving must delay imports.
 
-
-def _unused_handle():
-  """Returns a placeholder as a handle that is not supposed to be accessed."""
-  error_message = ("Trying to access a placeholder that is not supposed to be "
-                   "executed. This means you are executing a graph generated "
-                   "from the cross-replica context in an in-replica context.")
-  save_error_message = (
-      "It seems that you are trying to save a "
-      "tf.types.experimental.ConcreteFunction that involves a distributed "
-      "model, and the model contains parts that are loaded form a SavedModel. "
-      "It's not supported to save such tf.types.experimental.ConcreteFunction. "
-      "Try saving a tf.function with input_signature instead, and file a bug if"
-      " there are still issues.")
-
-  assert_op = control_flow_assert.Assert(
-      array_ops.placeholder_with_default(False, shape=()), [error_message])
-  if (not context.executing_eagerly()
-     ) and ops.get_default_graph().building_function:
-    ops.get_default_graph().mark_as_unsaveable(save_error_message)
-
-  with ops.control_dependencies([assert_op]):
-    return array_ops.placeholder(dtype=dtypes.resource)
+# TODO(b/134426265): Switch back to single-quotes to match the rest of the file
+# once the issue with copybara is fixed.
+# pylint:disable=g-inconsistent-quotes
+models_lib = LazyLoader("models_lib", globals(),
+                        "tensorflow.python.keras.models")
+base_layer = LazyLoader(
+    "base_layer", globals(),
+    "tensorflow.python.keras.engine.base_layer")
+layers_module = LazyLoader(
+    "layers_module", globals(),
+    "tensorflow.python.keras.layers")
+input_layer = LazyLoader(
+    "input_layer", globals(),
+    "tensorflow.python.keras.engine.input_layer")
+functional_lib = LazyLoader(
+    "functional_lib", globals(),
+    "tensorflow.python.keras.engine.functional")
+training_lib = LazyLoader(
+    "training_lib", globals(),
+    "tensorflow.python.keras.engine.training")
+training_lib_v1 = LazyLoader(
+    "training_lib_v1", globals(),
+    "tensorflow.python.keras.engine.training_v1")
+metrics = LazyLoader("metrics", globals(),
+                     "tensorflow.python.keras.metrics")
+recurrent = LazyLoader(
+    "recurrent", globals(),
+    "tensorflow.python.keras.layers.recurrent")
+# pylint:enable=g-inconsistent-quotes
 
 
-class _WrapperFunction(function.ConcreteFunction):
-  """A class wraps a concrete function to handle different distributed contexts.
+PUBLIC_ATTRIBUTES = CommonEndpoints.all_functions.union(
+    CommonEndpoints.all_checkpointable_objects)
+PUBLIC_ATTRIBUTES.add(constants.KERAS_ATTR)
 
-  The reason for wrapping a concrete function is because the _captured_inputs
-  fields used for in-replica context and cross-replica context are different.
-  When `load()` is called from within a tf.distribute.strategy scope, the
-  captured inputs are distributed variables. When using these distributed
-  variables during calling the function, we need different approaches when it is
-  in-replica and when it is not in-replica. When it is in replica, naturally we
-  should use the corresponding component of the distributed variable; when it is
-  not in-replica, calling the function should mean that it is constructing a
-  graph that is not actually going to be used. A typical use case is when
-  constructing a functional model. In this case, return a placeholder with a
-  control dependency to ensure that is never accessed.
+
+def load(path, compile=True, options=None):  # pylint: disable=redefined-builtin
+  """Loads Keras objects from a SavedModel.
+
+  Any Keras layer or model saved to the SavedModel will be loaded back
+  as Keras objects. Other objects are loaded as regular trackable objects (same
+  as `tf.saved_model.load`).
+
+  Currently, Keras saving/loading only retains the Keras object's weights,
+  losses, and call function.
+
+  The loaded model can be re-compiled, but the original optimizer, compiled loss
+  functions, and metrics are not retained. This is temporary, and `model.save`
+  will soon be able to serialize compiled models.
+
+  Args:
+    path: Path to SavedModel.
+    compile: If true, compile the model after loading it.
+    options: Optional `tf.saved_model.LoadOptions` object that specifies
+      options for loading from SavedModel.
+
+
+  Returns:
+    Object loaded from SavedModel.
+  """
+  # TODO(kathywu): Add saving/loading of optimizer, compiled losses and metrics.
+  # TODO(kathywu): Add code to load from objects that contain all endpoints
+
+  # Look for metadata file or parse the SavedModel
+  metadata = saved_metadata_pb2.SavedMetadata()
+  meta_graph_def = loader_impl.parse_saved_model(path).meta_graphs[0]
+  object_graph_def = meta_graph_def.object_graph_def
+  path_to_metadata_pb = os.path.join(path, constants.SAVED_METADATA_PATH)
+  if gfile.Exists(path_to_metadata_pb):
+    try:
+      with gfile.GFile(path_to_metadata_pb, 'rb') as f:
+        file_content = f.read()
+      metadata.ParseFromString(file_content)
+    except message.DecodeError as e:
+      raise IOError('Cannot parse keras metadata {}: {}.'
+                    .format(path_to_metadata_pb, str(e)))
+  else:
+    logging.warning('SavedModel saved prior to TF 2.5 detected when loading '
+                    'Keras model. Please ensure that you are saving the model '
+                    'with model.save() or tf.keras.models.save_model(), *NOT* '
+                    'tf.saved_model.save(). To confirm, there should be a file '
+                    'named "keras_metadata.pb" in the SavedModel directory.')
+    _read_legacy_metadata(object_graph_def, metadata)
+
+  if not metadata.nodes:
+    # When there are no Keras objects, return the results from the core loader
+    return tf_load.load(path, options=options)
+
+  # Recreate layers and metrics using the info stored in the metadata.
+  keras_loader = KerasObjectLoader(metadata, object_graph_def)
+  keras_loader.load_layers(compile=compile)
+
+  # Generate a dictionary of all loaded nodes.
+  nodes_to_load = {'root': None}
+  for node_id, loaded_node in keras_loader.loaded_nodes.items():
+    nodes_to_load[keras_loader.get_path(node_id)] = loaded_node
+  loaded = tf_load.load_partial(path, nodes_to_load, options=options)
+
+  # Finalize the loaded layers and remove the extra tracked dependencies.
+  keras_loader.finalize_objects()
+  keras_loader.del_tracking()
+
+  model = loaded['root']
+
+  # pylint: disable=protected-access
+  if isinstance(model, training_lib.Model) and compile:
+    # TODO(kathywu): Use compiled objects from SavedModel, instead of
+    # creating new objects from the training config.
+    training_config = model._serialized_attributes['metadata'].get(
+        'training_config', None)
+    if training_config is not None:
+      model.compile(**saving_utils.compile_args_from_training_config(
+          training_config), from_serialized=True)
+      saving_utils.try_build_compiled_arguments(model)
+      if isinstance(model.optimizer, optimizer_v2.OptimizerV2):
+        if (model.optimizer.get_slot_names()):
+          logging.warning('Your optimizer uses slots. '
+                          'Slots cannot be restored from saved_model, '
+                          'as a result, your model is starting with  '
+                          'a new initialized optimizer.')
+    else:
+      logging.warning('No training configuration found in save file, so the '
+                      'model was *not* compiled. Compile it manually.')
+  # pylint: enable=protected-access
+
+  # Force variables and resources to initialize.
+  if not context.executing_eagerly():
+    sess = backend.get_session()  # Variables are initialized by this call.
+    sess.run(ops.get_collection(ops.GraphKeys.TABLE_INITIALIZERS))
+
+  return model
+
+
+def _read_legacy_metadata(object_graph_def, metadata):
+  """Builds a KerasMetadata proto from the SavedModel ObjectGraphDef."""
+  # Older SavedModels store the metadata directly in the proto instead of the
+  # separate pb file.
+  node_paths = _generate_object_paths(object_graph_def)
+  for node_id, proto in enumerate(object_graph_def.nodes):
+    if (proto.WhichOneof('kind') == 'user_object' and
+        proto.user_object.identifier in constants.KERAS_OBJECT_IDENTIFIERS):
+      if not proto.user_object.metadata:
+        raise ValueError('Unable to create a Keras model from this SavedModel. '
+                         'This SavedModel was created with '
+                         '`tf.saved_model.save`, and lacks the Keras metadata.'
+                         'Please save your Keras model by calling `model.save`'
+                         'or `tf.keras.models.save_model`.')
+      metadata.nodes.add(
+          node_id=node_id,
+          node_path=node_paths[node_id],
+          version=versions_pb2.VersionDef(
+              producer=1, min_consumer=1, bad_consumers=[]),
+          identifier=proto.user_object.identifier,
+          metadata=proto.user_object.metadata)
+
+
+def _generate_object_paths(object_graph_def):
+  """Traverses through an ObjectGraphDef and builds a map of all node paths."""
+  paths = {0: 'root'}
+  nodes_to_visit = [0]
+
+  while nodes_to_visit:
+    current_node = nodes_to_visit.pop()
+    current_path = paths[current_node]
+    for reference in object_graph_def.nodes[current_node].children:
+      if reference.node_id in paths:
+        continue
+      paths[reference.node_id] = '{}.{}'.format(current_path,
+                                                reference.local_name)
+      nodes_to_visit.append(reference.node_id)
+
+  return paths
+
+
+def _is_graph_network(layer):
+  """Determines whether the layer is a graph network."""
+  # pylint: disable=protected-access
+  if isinstance(layer, RevivedNetwork):
+    return False
+  elif isinstance(layer, functional_lib.Functional):
+    return (layer._is_graph_network or
+            isinstance(layer, models_lib.Sequential))
+  return False
+
+
+class KerasObjectLoader(object):
+  """Loader that recreates Keras objects (e.g. layers, models).
+
+  Layers and models are revived from either the config or SavedModel following
+  these rules:
+  1. If object is a graph network (i.e. Sequential or Functional) then it will
+     be initialized using the structure from the config only after the children
+     layers have been created. Graph networks must be initialized with inputs
+     and outputs, so all child layers must be created beforehand.
+  2. If object's config exists and the class can be found, then revive from
+     config.
+  3. Object may have already been created if its parent was revived from config.
+     In this case, do nothing.
+  4. If nothing of the above applies, compose the various artifacts from the
+     SavedModel to create a subclassed layer or model. At this time, custom
+     metrics are not supported.
+
   """
 
-  def __init__(self, concrete_function):
-    # Shallow copy the concrete_function
-    self.__dict__.update(vars(concrete_function))
+  def __init__(self, metadata, object_graph_def):
+    self._metadata = {x.node_id: x for x in metadata.nodes}
+    self._proto = object_graph_def
 
-  def _call_flat(self, args, captured_inputs):
+    self._node_paths = {node_data.node_id: node_data.node_path
+                        for node_data in metadata.nodes}
+    self.loaded_nodes = {}  # Maps node path -> loaded node
 
-    def get_handle(x):
-      return x.handle if distribute_utils.is_distributed_variable(x) else x
+    # Store all node ids that have already been traversed when tracking nodes
+    # that were recreated from the config.
+    self._traversed_nodes_from_config = set()
 
-    def get_unused_handle(x):
-      return _unused_handle() if distribute_utils.is_distributed_variable(x)   \
-          else x
+    # Maps model id -> (blank model obj, list of child layer or their node ids)
+    # This tracks all layers in functional and sequential models. These models
+    # are only reconstructed after all of their child layers have been created.
+    self.model_layer_dependencies = {}
+    self._models_to_reconstruct = []
 
-    if (distribute_lib.get_replica_context() is not None or
-        values_util.is_saving_non_distributed()):
-      # If we're in the replica context or are saving a non-distributed version
-      # of the model, we resolve the captured variables to the corresponding
-      # resource handle. In both situation we call var.handle, but it has
-      # different behavior. In the replica context, var.handle resolves the
-      # replica local variable handle if the variable is replicated. When saving
-      # a non-distributed version of the model, var.handle resolves to the
-      # primary variable handle, since we only save one copy of a replicated
-      # variable.
-      captured_inputs = list(map(get_handle, captured_inputs))
-    else:  # cross-replica context
-      captured_inputs = list(map(get_unused_handle, captured_inputs))
-    return super()._call_flat(args, captured_inputs)
-
-
-class Loader(object):
-  """Helper class to load an object-based SavedModel."""
-
-  def __init__(self, object_graph_proto, saved_model_proto, export_dir,
-               ckpt_options, save_options, filters):
-    meta_graph = saved_model_proto.meta_graphs[0]
-    self._asset_file_def = meta_graph.asset_file_def
-    self._operation_attributes = {
-        node.name: node.attr for node in meta_graph.graph_def.node}
-    self._proto = object_graph_proto
-    self._export_dir = export_dir
-    self._concrete_functions = (
-        function_deserialization.load_function_def_library(
-            library=meta_graph.graph_def.library,
-            saved_object_graph=self._proto,
-            wrapper_function=_WrapperFunction))
-    # Store a set of all concrete functions that have been set up with
-    # captures.
-    self._restored_concrete_functions = set()
-    self._checkpoint_options = ckpt_options
-    self._save_options = save_options
-
-    # Metagraph has a mapping from FunctionDef name to aliases
-    self._concrete_function_aliases = meta_graph.meta_info_def.function_aliases
-    self.function_aliases = {}
-    if self._save_options.experimental_load_function_aliases:
-      # Create a mapping from aliases to polymorphic restored functions or lists
-      # of concrete functions. This mapping can later be used with SaveOptions
-      # when re-saving the loaded object to a SavedModel. We start with a
-      # mapping from aliases to lists of concrete functions. Later in
-      # _recreate_function, on a entry by entry basis, we replace lists with
-      # polymorphic restored functions if the concrete function associated with
-      # a restored function is identical to a list of concrete functions in an
-      # entry.
-      concrete_func_list_by_alias = collections.defaultdict(list)
-      for concrete_func_name, alias in self._concrete_function_aliases.items():
-        if concrete_func_name not in self._concrete_functions:
-          logging.warn(
-              (
-                  "ConcreteFunction `%s` is listed in function alias but it"
-                  " is not found."
-              ),
-              concrete_func_name,
-          )
-          continue
-        concrete_function = self._concrete_functions[concrete_func_name]
-        concrete_func_list_by_alias[alias].append(concrete_function)
-      self.function_aliases = dict(concrete_func_list_by_alias)
-
-    self._pretty_printer = checkpoint.ObjectGraphProtoPrettyPrinter(self._proto)
-
-    # Stores user-defined node_filters argument.
-    self._node_filters = filters
-    # Stores map of string paths to integers.
-    self._node_path_to_id = self._convert_node_paths_to_ints()
-    self._loaded_nodes = {}
-    if isinstance(filters, dict):
-      # If node_filters is a dict, then the values may contain already created
-      # trackable objects. In this case, create a dictionary mapping node IDs to
-      # the already created nodes. This dict will be updated in
-      # `_retrieve_all_filtered_nodes` with tracked children.
-      for node_path, node in filters.items():
-        if isinstance(node, tuple):
-          self._loaded_nodes[self._node_path_to_id[node_path]] = node
-        else:
-          self._loaded_nodes[self._node_path_to_id[node_path]] = (node, setattr)
-
-    # Get a list of all integer node ids to load, or None if all nodes should be
-    # loaded. This list includes ids of child nodes.
-    self._filtered_nodes = self._retrieve_all_filtered_nodes()
-
-    # Order all nodes or filtered nodes using the dependencies.
-    self._ordered_node_ids = self._generate_ordered_node_ids()
-
-    self._load_all()
-
-    if not save_options.experimental_skip_checkpoint:
-      self._restore_checkpoint()
-    for node in self._nodes:
-      if isinstance(node, resource.CapturableResource):
-        init_op = node._initialize()  # pylint: disable=protected-access
-        if not context.executing_eagerly():
-          ops.add_to_collection(ops.GraphKeys.TABLE_INITIALIZERS, init_op)
-
-  def _convert_node_paths_to_ints(self):
-    """Maps all string node paths in node_filters to the int node ids."""
-    if self._node_filters is None:
-      return None
-    path_to_int = {}
-    for node_id in self._node_filters:
-      int_node_id = None
-      if isinstance(node_id, str):
-        node_path = node_id.split(".")
-        if node_path[0] != "root":
-          raise ValueError(
-              "When passing string identifiers to node_filters, the first name"
-              f" must be root. Received {node_path[0]}.")
-        int_node_id = 0
-        for n, name in enumerate(node_path[1:]):
-          int_node_id = self._find_node_child(
-              int_node_id, name, ".".join(node_path[:n+2]))
-        path_to_int[node_id] = int_node_id
-      else:
-        raise TypeError("Elements in node_filters must be strings.")
-    return path_to_int
-
-  def _retrieve_all_filtered_nodes(self):
-    """Traverses through the object graph to get the IDs of all nodes to load.
-
-    As a side-effect, if node_filters is a dictionary that contains already-
-    created objects, then the children tracked by those objects will be
-    added to node_filters.
-
-    Returns:
-      List of all nodes to load, or None if all nodes should be loaded.
-
-    """
-    if self._node_filters is None:
-      return None  # All nodes should be loaded.
-
-    all_filtered_nodes = set()
-    nodes_to_visit = list(self._node_filters)
-
-    while nodes_to_visit:
-      node_path = nodes_to_visit.pop(0)
-      node_id = self._node_path_to_id[node_path]
-      if node_id in all_filtered_nodes:
+  def del_tracking(self):
+    """Removes tracked references that are only used when loading the model."""
+    # Now that the node object has been fully loaded, and the checkpoint has
+    # been restored, the object no longer needs to track objects added from
+    # SerializedAttributes. (Note that saving a training checkpoint still
+    # functions correctly, because layers and variables are tracked separately
+    # by the Layer object.)
+    # TODO(kathywu): Instead of outright deleting these nodes (which would
+    # make restoring from a different checkpoint tricky), mark them as extra
+    # dependencies that are OK to overwrite.
+    for node in self.loaded_nodes.values():
+      node = node[0]
+      if not isinstance(node, base_layer.Layer):
+        # Loaded nodes can contain other trackable objects created when
+        # loading layers from the config, such as variables.
         continue
-      all_filtered_nodes.add(node_id)
+      for name in PUBLIC_ATTRIBUTES:
+        node._delete_tracking(name)  # pylint: disable=protected-access
 
-      node, setter = self._loaded_nodes.get(node_id, (None, None))
-      if node is not None:
-        if not isinstance(node, base.Trackable):
-          raise TypeError(
-              "Error when processing dictionary values passed to nodes_to_load."
-              f"Object at {node_path} is expected to be a checkpointable (i.e. "
-              "'trackable') TensorFlow object (e.g. tf.Variable, tf.Module or "
-              "Keras layer).")
-        node._maybe_initialize_trackable()  # pylint: disable=protected-access
+      if isinstance(node, functional_lib.Functional):
+        # Delete the temporary layer dependencies, which were used to restore
+        # the checkpointed values. When the model is live, the user can delete
+        # or add layers to the model at any time, so these layer dependencies
+        # may be obsolete.
+        dependencies = list(node._self_unconditional_dependency_names)  # pylint: disable=protected-access
+        for name in dependencies:
+          if re.match(r'^layer(_with_weights)?-[\d+]', name) is not None:
+            node._delete_tracking(name)  # pylint: disable=protected-access
 
-      for reference in self._proto.nodes[node_id].children:
-        child_object, _ = self._loaded_nodes.get(
-            reference.node_id, (None, None))
+  def _add_children_recreated_from_config(self, obj, proto, node_id):
+    """Recursively records objects recreated from config."""
+    # pylint: disable=protected-access
+    if node_id in self._traversed_nodes_from_config:
+      return
 
-        # See if node already tracks the child reference, in which case add the
-        # child to the loaded_nodes dict.
-        if child_object is None and node is not None:
-          child_object = node._lookup_dependency(reference.local_name)  # pylint: disable=protected-access
-          if isinstance(child_object, data_structures.TrackableDataStructure):
-            # Make setattr a noop to avoid overwriting already existing data
-            # structures.
-            setter = lambda *args: None
+    parent_path = self._node_paths[node_id]
+    self._traversed_nodes_from_config.add(node_id)
+    obj._maybe_initialize_trackable()
+    if isinstance(obj, base_layer.Layer) and not obj.built:
+      metadata = json_utils.decode(self._metadata[node_id].metadata)
+      self._try_build_layer(obj, node_id, metadata.get('build_input_shape'))
 
-            self._loaded_nodes[reference.node_id] = (child_object, setter)
+    # Create list of all possible children
+    children = []
+    # Look for direct children
+    for reference in proto.children:
+      obj_child = obj._lookup_dependency(reference.local_name)
+      children.append((obj_child, reference.node_id, reference.local_name))
 
-        child_path = "{}.{}".format(node_path, reference.local_name)
-        self._node_path_to_id[child_path] = reference.node_id
-        nodes_to_visit.append(child_path)
+    # Add metrics that may have been added to the layer._metrics list.
+    # This is stored in the SavedModel as layer.keras_api.layer_metrics in
+    # SavedModels created after Tf 2.2.
+    metric_list_node_id = self._search_for_child_node(
+        node_id, [constants.KERAS_ATTR, 'layer_metrics'])
+    if metric_list_node_id is not None and hasattr(obj, '_metrics'):
+      obj_metrics = {m.name: m for m in obj._metrics}
+      for reference in self._proto.nodes[metric_list_node_id].children:
+        metric = obj_metrics.get(reference.local_name)
+        if metric is not None:
+          metric_path = '{}.layer_metrics.{}'.format(constants.KERAS_ATTR,
+                                                     reference.local_name)
+          children.append((metric, reference.node_id, metric_path))
 
-    if 0 in all_filtered_nodes:
-      return None
-    return all_filtered_nodes
+    for (obj_child, child_id, child_name) in children:
+      child_proto = self._proto.nodes[child_id]
 
-  def _find_node_child(self, node_id, child_name, path):
-    for reference in self._proto.nodes[node_id].children:
-      if reference.local_name == child_name:
-        return reference.node_id
-    raise ValueError(f"Unable to find node {path}.")
-
-  def _load_all(self):
-    """Loads all nodes and functions from the SavedModel and their edges."""
-    self._load_nodes()
-    self._load_edges()
-
-    # Set up concrete functions that aren't part of the object graph
-    # (e.g. gradient functions)
-    self._setup_remaining_functions()
-    self._load_checkpoint_save_and_restore_functions()
-
-  def _load_checkpoint_save_and_restore_functions(self):
-    """Restores the checkpoint-related save/restore functions to all nodes."""
-    temp_session = [None]
-    for node_id, proto in self._iter_all_nodes():
-      node = self.get(node_id)
-      if proto.saveable_objects.keys() == {
-          trackable_utils.SERIALIZE_TO_TENSORS_NAME}:
-        # Restore Trackable serialize- and restore-from-tensor functions.
-        assert len(proto.saveable_objects) == 1
-        saveable_object_proto = next(iter(proto.saveable_objects.values()))
-        save_fn_id = saveable_object_proto.save_function
-        restore_fn_id = saveable_object_proto.restore_function
-        node._serialize_to_tensors = self.get(save_fn_id)  # pylint: disable=protected-access
-        node._restore_from_tensors = self.get(restore_fn_id)  # pylint: disable=protected-access
+      if not isinstance(obj_child, trackable.Trackable):
+        continue
+      if (child_proto.user_object.identifier in
+          revived_types.registered_identifiers()):
+        setter = revived_types.get_setter(child_proto.user_object)
+      elif obj_child._object_identifier in constants.KERAS_OBJECT_IDENTIFIERS:
+        setter = _revive_setter
       else:
-        # Restore legacy SaveableObject functions.
-        saveable_fn_by_name = {}
-        for name, saveable_object_proto in proto.saveable_objects.items():
-          save_fn_id = saveable_object_proto.save_function
-          restore_fn_id = saveable_object_proto.restore_function
-          saveable_fn_by_name[name] = (self.get(save_fn_id),
-                                       self.get(restore_fn_id))
+        setter = setattr
+        # pylint: enable=protected-access
 
-        node._self_saveable_object_factories = (  # pylint: disable=protected-access
-            saveable_object_util.recreate_saveable_objects(saveable_fn_by_name,
-                                                           temp_session))
+      if child_id in self.loaded_nodes:
+        if self.loaded_nodes[child_id][0] is not obj_child:
+          # This means that the same trackable object is referenced by two
+          # different objects that were recreated from the config.
+          logging.warning(
+              'Looks like there is an object (perhaps variable or '
+              'layer) that is shared between different layers/models. '
+              'This may cause issues when restoring the variable '
+              'values. Object: {}'.format(obj_child))
+        continue
+
+      # Overwrite variable names with the ones saved in the SavedModel.
+      if (child_proto.WhichOneof('kind') == 'variable' and
+          child_proto.variable.name):
+        obj_child._handle_name = child_proto.variable.name + ':0'  # pylint: disable=protected-access
+
+      if isinstance(obj_child, data_structures.TrackableDataStructure):
+        setter = lambda *args: None
+
+      child_path = '{}.{}'.format(parent_path, child_name)
+      self._node_paths[child_id] = child_path
+      self._add_children_recreated_from_config(
+          obj_child, child_proto, child_id)
+      self.loaded_nodes[child_id] = obj_child, setter
+
+  def load_layers(self, compile=True):  # pylint: disable=redefined-builtin
+    """Load all layer nodes from the metadata."""
+    # Load metrics after models and layers, since it's likely that models
+    # and layers will create the metric when initialized (this avoids wasting
+    # time by creating objects multiple times).
+    metric_list = []
+    for node_metadata in self._metadata.values():
+      if node_metadata.identifier == constants.METRIC_IDENTIFIER:
+        metric_list.append(node_metadata)
+        continue
+
+      self.loaded_nodes[node_metadata.node_id] = self._load_layer(
+          node_metadata.node_id, node_metadata.identifier,
+          node_metadata.metadata)
+
+    for node_metadata in metric_list:
+      try:
+        self.loaded_nodes[node_metadata.node_id] = self._load_layer(
+            node_metadata.node_id, node_metadata.identifier,
+            node_metadata.metadata)
+      except ValueError:
+        # Metrics are only needed when the model is compiled later. We ignore
+        # errors when trying to load custom metrics when `compile=False` until
+        # custom metrics are serialized properly (b/135550038).
+        if compile:
+          raise
+        logging.warning('Unable to restore custom metric. Please ensure that '
+                        'the layer implements `get_config` and `from_config` '
+                        'when saving. In addition, please use the '
+                        '`custom_objects` arg when calling `load_model()`.')
+
+  def _load_layer(self, node_id, identifier, metadata):
+    """Load a single layer from a SavedUserObject proto."""
+    metadata = json_utils.decode(metadata)
+
+    # If node was already created
+    if node_id in self.loaded_nodes:
+      node, setter = self.loaded_nodes[node_id]
+
+      # Revive setter requires the object to have a `_serialized_attributes`
+      # property. Add it here.
+      _maybe_add_serialized_attributes(node, metadata)
+
+      config = metadata.get('config')
+      if _is_graph_network(node) and generic_utils.validate_config(config):
+        child_nodes = self._get_child_layer_node_ids(node_id)
+        self.model_layer_dependencies[node_id] = (node, child_nodes)
+        if not child_nodes:
+          self._models_to_reconstruct.append(node_id)
+      return node, setter
+
+    # Detect whether this object can be revived from the config. If not, then
+    # revive from the SavedModel instead.
+    obj, setter = self._revive_from_config(identifier, metadata, node_id)
+    if obj is None:
+      obj, setter = revive_custom_object(identifier, metadata)
+
+    # Add an attribute that stores the extra functions/objects saved in the
+    # SavedModel. Most of these functions/objects are ignored, but some are
+    # used later in the loading process (e.g. the list of regularization
+    # losses, or the training config of compiled models).
+    _maybe_add_serialized_attributes(obj, metadata)
+    return obj, setter
+
+  def _revive_from_config(self, identifier, metadata, node_id):
+    """Revives a layer/model from config, or returns None."""
+    if identifier == constants.METRIC_IDENTIFIER:
+      obj = self._revive_metric_from_config(metadata)
+    else:
+      obj = (
+          self._revive_graph_network(identifier, metadata, node_id) or
+          self._revive_layer_or_model_from_config(metadata, node_id))
+
+    if obj is None:
+      return None, None
+
+    setter = self._config_node_setter(_revive_setter)
+    self._add_children_recreated_from_config(
+        obj, self._proto.nodes[node_id], node_id)
+    return obj, setter
+
+  def _revive_graph_network(self, identifier, metadata, node_id):
+    """Revives a graph network from config."""
+    # Determine whether the metadata contains information for reviving a
+    # functional or Sequential model.
+    config = metadata.get('config')
+    if not generic_utils.validate_config(config):
+      return None
+
+    class_name = compat.as_str(metadata['class_name'])
+    if generic_utils.get_registered_object(class_name) is not None:
+      return None
+    model_is_functional_or_sequential = (
+        metadata.get('is_graph_network', False) or
+        class_name == 'Sequential' or
+        class_name == 'Functional')
+    if not model_is_functional_or_sequential:
+      return None
+
+    # Revive functional and sequential models as blank model objects for now (
+    # must be initialized to enable setattr tracking and attribute caching).
+    # Reconstruction of the network is deferred until all of the model's layers
+    # have been revived.
+    if class_name == 'Sequential':
+      model = models_lib.Sequential(name=config['name'])
+    # The model is a custom Sequential model.
+    elif identifier == constants.SEQUENTIAL_IDENTIFIER:
+      # Uses the custom class name, since the config does not have one.
+      model = models_lib.Sequential(name=class_name)
+    else:
+      model = models_lib.Functional(
+          inputs=[], outputs=[], name=config['name'])
+
+    # Record this model and its layers. This will later be used to reconstruct
+    # the model.
+    layers = self._get_child_layer_node_ids(node_id)
+    self.model_layer_dependencies[node_id] = (model, layers)
+    if not layers:
+      self._models_to_reconstruct.append(node_id)
+    return model
+
+  def _revive_layer_or_model_from_config(self, metadata, node_id):
+    """Revives a layer/custom model from config; returns None if infeasible."""
+    # Check that the following requirements are met for reviving from config:
+    #    1. Object can be deserialized from config.
+    #    2. If the object needs to be built, then the build input shape can be
+    #       found.
+    class_name = metadata.get('class_name')
+    config = metadata.get('config')
+    shared_object_id = metadata.get('shared_object_id')
+    must_restore_from_config = metadata.get('must_restore_from_config')
+    if not generic_utils.validate_config(config):
+      return None
+
+    try:
+      obj = layers_module.deserialize(
+          generic_utils.serialize_keras_class_and_config(
+              class_name, config, shared_object_id=shared_object_id))
+    except ValueError:
+      if must_restore_from_config:
+        raise RuntimeError(
+            'Unable to restore a layer of class {cls}. Layers of '
+            'class {cls} require that the class be provided to '
+            'the model loading code, either by registering the '
+            'class using @keras.utils.register_keras_serializable '
+            'on the class def and including that file in your '
+            'program, or by passing the class in a '
+            'keras.utils.CustomObjectScope that wraps this load '
+            'call.'.format(cls=class_name))
+      else:
+        return None
+
+    # Use the dtype, name, and trainable status. Often times these are not
+    # specified in custom configs, so retrieve their values from the metadata.
+    # pylint: disable=protected-access
+    obj._name = metadata['name']
+    if metadata.get('trainable') is not None:
+      obj.trainable = metadata['trainable']
+    if metadata.get('dtype') is not None:
+      obj._set_dtype_policy(metadata['dtype'])
+    if metadata.get('stateful') is not None:
+      obj.stateful = metadata['stateful']
+    # Restore model save spec for subclassed models. (layers do not store a
+    # SaveSpec)
+    if isinstance(obj, training_lib.Model):
+      save_spec = metadata.get('save_spec')
+      if save_spec is not None:
+        obj._set_save_spec(save_spec)
+    # pylint: enable=protected-access
+
+    build_input_shape = metadata.get('build_input_shape')
+    built = self._try_build_layer(obj, node_id, build_input_shape)
+
+    if not built:
+      # If the layer cannot be built, revive a custom layer instead.
+      return None
+    return obj
+
+  def _revive_metric_from_config(self, metadata):
+    """Revives a metric object using the config saved in the metadata."""
+    class_name = compat.as_str(metadata['class_name'])
+    config = metadata.get('config')
+
+    if not generic_utils.validate_config(config):
+      return None
+
+    try:
+      obj = metrics.deserialize(
+          generic_utils.serialize_keras_class_and_config(class_name, config))
+    except ValueError:
+      return None
+
+    build_input_shape = metadata.get('build_input_shape')
+    if build_input_shape is not None and hasattr(obj, '_build'):
+      obj._build(build_input_shape)  # pylint: disable=protected-access
+
+    return obj
+
+  def _try_build_layer(self, obj, node_id, build_input_shape):
+    """Attempts to build the layer."""
+    if obj.built or hasattr(obj.build, '_is_default'):
+      obj.built = True
+      return True
+
+    if build_input_shape is None:
+      build_input_shape = self._infer_inputs(node_id, convert_to_shapes=True)
+
+    if build_input_shape is not None:
+      obj.build(build_input_shape)
+      base_layer.Layer.build(obj, build_input_shape)
+      return True
+
+    return False
 
   def _load_edges(self):
-    """Adds edges from objects to other objects and functions."""
-    for node_id, object_proto in self._iter_all_nodes():
-      self._add_object_graph_edges(object_proto, node_id)
+    """Add edges for all nodes that are not waiting on initialization."""
+    for node_id, proto in enumerate(self._proto.nodes):
+      if node_id not in self.model_layer_dependencies:
+        self._add_object_graph_edges(proto, node_id)
 
-    # If root object isn't loaded, then create edges from the root for
-    # checkpoint compatibility.
-    if self._filtered_nodes is not None and 0 not in self._filtered_nodes:
-      root = self.get(0)
-      for node_path in self._node_filters:
-        loaded_node = self._nodes[self._node_path_to_id[node_path]]
-        path = node_path.split(".")
-        current_node = root
-        for name in path[1:-1]:
-          if not hasattr(current_node, name):
-            setattr(current_node, name, self._recreate_base_user_object()[0])
-          current_node = getattr(current_node, name)
-        if not hasattr(current_node, path[-1]):
-          setattr(current_node, path[-1], loaded_node)
+  def get_path(self, node_id):
+    return self._node_paths[node_id]
 
-  def _add_object_graph_edges(self, proto, node_id):
-    """Adds edges from an object to its children."""
-    obj = self._nodes[node_id]
-    setter = self._node_setters[node_id]
+  def finalize_objects(self):
+    """Finish setting up Keras objects.
 
-    for reference in proto.children:
-      setter(obj, reference.local_name, self._nodes[reference.node_id])
-      # Note: if an object has an attribute `__call__` add a class method
-      # that allows `obj()` syntax to work. This is done per-instance to
-      # allow `callable` to be used to find out if an object is callable.
-      if reference.local_name == "__call__" and not callable(obj):
-        setattr(type(obj), "__call__", _call_attribute)
+    This function is executed after all objects and functions have been created.
+    Call functions and losses are attached to each layer, and once all layers
+    have been fully set up, graph networks are initialized.
 
-  def _setup_remaining_functions(self):
-    concrete_function_names = sorted(self._proto.concrete_functions.keys())
-    for name in concrete_function_names:
-      if name in self._restored_concrete_functions:
-        continue
-      self._setup_function_captures(name, self._nodes)
-
-  def _setup_function_captures(self, concrete_function_name, nodes):
-    """Setup captures and variables in a restored function."""
-    if concrete_function_name in self._restored_concrete_functions:
-      return
-    self._restored_concrete_functions.add(concrete_function_name)
-    concrete_function = self._concrete_functions[concrete_function_name]
-    proto = self._proto.concrete_functions[concrete_function_name]
-    inputs = [nodes[node_id] for node_id in proto.bound_inputs]
-    restore_captures.restore_captures(concrete_function, inputs)
-
-  def _initialize_loaded_nodes(self):
-    nodes = {}
-    node_setters = {}
-    for node_id, (node, setter) in self._loaded_nodes.items():
-      nodes[node_id] = node
-      node_setters[node_id] = setter
-    return nodes, node_setters
-
-  def _get_node_dependencies(self, proto):
-    """Returns a dictionary of all dependencies of an object.
-
-    Args:
-      proto: A SavedObject proto.
-
-    Returns:
-      Dict mapping string dependency name *or* int node id to the node id.
-      The int node id key is used for mapping function captures.
+    Subclassed models that are revived from the SavedModel are treated like
+    layers, and have their call/loss functions attached here.
     """
-    dependencies = {ref.local_name: ref.node_id for ref in proto.dependencies}
-    kind = proto.WhichOneof("kind")
-    if kind == "function":
-      concrete_functions = proto.function.concrete_functions
-      for fn_name in concrete_functions:
-        for bound_input in self._proto.concrete_functions[fn_name].bound_inputs:
-          dependencies[bound_input] = bound_input
-    elif kind == "bare_concrete_function":
-      fn_name = proto.bare_concrete_function.concrete_function_name
-      for bound_input in self._proto.concrete_functions[fn_name].bound_inputs:
-        dependencies[bound_input] = bound_input
-    elif kind == "resource":
-      # Make sure that the resource creator is listed as a dependency.
-      for child in proto.children:
-        if child.local_name == "_create_resource":
-          dependencies["_create_resource"] = child.node_id
-    return dependencies
-
-  def _generate_ordered_node_ids(self):
-    """Orders the node ids so that dependencies appear first."""
-    if self._filtered_nodes is None:
-      unordered_ids = range(len(self._proto.nodes))
-    else:
-      unordered_ids = list(self._filtered_nodes)
-
-    # Maps node ids -> list of dependencies (ids of other nodes that must be
-    # loaded before it).
-    dependency_map = collections.defaultdict(list)
-    for node_id in unordered_ids:
-      deps = dependency_map[node_id]
-      if self._loaded_nodes.get(node_id) is not None:
-        # Deps are only used if the node has not been created.
+    # Finish setting up layers and subclassed models. This step attaches call
+    # functions and losses to each object, and sets model inputs/outputs.
+    layers_revived_from_config = []
+    layers_revived_from_saved_model = []
+    for node_id, (node, _) in self.loaded_nodes.items():
+      if (not isinstance(node, base_layer.Layer) or
+          # Don't finalize models until all layers have finished loading.
+          node_id in self.model_layer_dependencies):
         continue
-      proto = self._proto.nodes[node_id]
-      for dep in set(self._get_node_dependencies(proto).values()):
-        deps.append(dep)
-        if self._filtered_nodes is not None and dep not in self._filtered_nodes:
-          raise ValueError(
-              "Unable to partially load SavedModel since the specified filter "
-              "does not include all required objects for loading (e.g. "
-              "variables used in functions or deserialization dependencies). "
-              "Please include this path in the filter: "
-              f"{self._pretty_printer.node_names[dep]}")
 
-      # Add optimizer slot variable to dependency map.
-      prev_slot = None
-      for slot_variable_proto in proto.slot_variables:
-        slot_variable_node_id = slot_variable_proto.slot_variable_node_id
-        # The optimizer and original variable must be created before the slot
-        # variable, since the slot variable is generated using the Optimizer's
-        # add_slot API.
-        slot_deps = dependency_map[slot_variable_node_id]
-        slot_deps.append(node_id)
-        slot_deps.append(slot_variable_proto.original_variable_node_id)
+      self._unblock_model_reconstruction(node_id, node)
 
-        if prev_slot is not None:
-          # Add previous slot to deps so that the optimizer slot variables are
-          # added in order. The ordering is needed because the slot name and
-          # variable are both added to ordered lists, which are exposed to the
-          # user via `Optimizer.get_slot_names()` and `Optimizer.weights`.
-          # TODO(kathywu): Maybe enforce some sort of deterministic ordering in
-          # `order_by_dependency` to avoid doing this?
-          slot_deps.append(prev_slot)
-        prev_slot = slot_variable_node_id
-    try:
-      return list(trackable_utils.order_by_dependency(dependency_map))
-    except trackable_utils.CyclicDependencyError:
-      # This should not happen since there is already a validation for cycles
-      # when saving, but raise an error just in case.
-      raise ValueError("Encountered a cycle in the deserialization dependencies"
-                       "in the SavedModel. This is extremely unexpected, please"
-                       "file a bug and make sure you are not manually modifying"
-                       " the SavedModel.")
-
-  def _iter_all_nodes(self):
-    for node_id in self._ordered_node_ids:
-      yield node_id, self._proto.nodes[node_id]
-
-  def _load_nodes(self):
-    """Load all saved objects."""
-    # `nodes` maps from node ids to recreated objects
-    # `node_setters` maps from node ids to setter functions
-    # (same signature as setattr) for setting children.
-    nodes, node_setters = self._initialize_loaded_nodes()
-
-    # Figure out which objects are slot variables. These objects are created
-    # with Optimizer.add_slot rather than _recreate_variable.
-    # Maps slot node id -> optimizer node id, SlotVariableReference proto
-    slot_variable_node_ids = {}
-
-    for node_id, proto in self._iter_all_nodes():
-      for slot_variable_proto in proto.slot_variables:
-        slot_variable_node_id = slot_variable_proto.slot_variable_node_id
-        slot_variable_node_ids[slot_variable_node_id] = (node_id,
-                                                         slot_variable_proto)
-
-    # Re-create everything.
-    for node_id, proto in self._iter_all_nodes():
-      if nodes.get(node_id) is not None:
+      if isinstance(node, input_layer.InputLayer):
         continue
-      elif node_id in slot_variable_node_ids:
-        # Use the public Optimizer interface when creating slot variables.
-        optimizer_node_id, slot_variable_proto = slot_variable_node_ids[node_id]
-        optimizer_object = nodes[optimizer_node_id]
-        optimized_variable = nodes[
-            slot_variable_proto.original_variable_node_id]
-        slot_variable = optimizer_object.add_slot(
-            var=optimized_variable,
-            slot_name=slot_variable_proto.slot_name)
-        nodes[slot_variable_proto.slot_variable_node_id] = slot_variable
-        node_setters[slot_variable_proto.slot_variable_node_id] = setattr
+      elif isinstance(node, metrics.Metric):
+        continue
+
+      if isinstance(node, (RevivedLayer, RevivedInputLayer)):
+        layers_revived_from_saved_model.append(node)
       else:
-        node, setter = self._recreate(proto, node_id, nodes)
-        nodes[node_id] = node
-        node_setters[node_id] = setter
+        layers_revived_from_config.append(node)
 
-    # If root object is not loaded, add a dummy root object for checkpoint
-    # compatibility.
-    if 0 not in nodes:
-      nodes[0] = self._recreate_base_user_object()[0]
+    _finalize_saved_model_layers(layers_revived_from_saved_model)
+    _finalize_config_layers(layers_revived_from_config)
 
-    self._nodes = [nodes.get(node_id)
-                   for node_id in range(len(self._proto.nodes))]
-    self._node_setters = node_setters
+    # Initialize graph networks, now that layer dependencies have been resolved.
+    self._reconstruct_all_models()
 
-  def _restore_checkpoint(self):
-    """Load state from checkpoint into the deserialized objects."""
-    variables_path = path_helpers.get_variables_path(self._export_dir)
-    # TODO(b/205010730): Clean use of private methods of TrackableSaver.
-    # pylint: disable=protected-access
-    saver = checkpoint.TrackableSaver(graph_view.ObjectGraphView(self.get(0)))
-    with ops.device("CPU"):
-      saver._file_prefix_placeholder = constant_op.constant(variables_path)
-    if self._save_options.allow_partial_checkpoint:
-      load_status = saver.restore(variables_path,
-                                  self._checkpoint_options).expect_partial()
-      load_status.assert_nontrivial_match()
-    else:
-      load_status = saver.restore(variables_path, self._checkpoint_options)
-      load_status.assert_existing_objects_matched()
-    ckpt = load_status._checkpoint
+  def _unblock_model_reconstruction(self, layer_id, layer):
+    """Removes layer from blocking model reconstruction."""
+    for model_id, v in self.model_layer_dependencies.items():
+      _, layers = v
+      if layer_id not in layers:
+        continue
+      layers[layers.index(layer_id)] = layer
+      if all(isinstance(x, base_layer.Layer) for x in layers):
+        self._models_to_reconstruct.append(model_id)
 
-    if not context.executing_eagerly():
-      reader = py_checkpoint_reader.NewCheckpointReader(variables_path)
+  def _reconstruct_all_models(self):
+    """Reconstructs the network structure of all models."""
+    all_initialized_models = set()
+    while self._models_to_reconstruct:
+      model_id = self._models_to_reconstruct.pop(0)
+      all_initialized_models.add(model_id)
+      model, layers = self.model_layer_dependencies[model_id]
+      self._reconstruct_model(model_id, model, layers)
+      _finalize_config_layers([model])
 
-      # When running in eager mode, the `restore` call above has already run and
-      # restored the state of trackables, and calling `position.restore_ops()`
-      # would re-run the restore. In graph mode, that will return a cached list
-      # of ops that must run to restore the object on that position. We have to
-      # wire them in the initializers of the objects so that they get
-      # initialized properly when using common practices (e.g. the ones used by
-      # ManagedSession) without further user action.
-      for object_id, obj in dict(ckpt.object_by_proto_id).items():
-        position = restore.CheckpointPosition(checkpoint=ckpt,
-                                              proto_id=object_id)
-        registered_saver = position.get_registered_saver_name()
-        if registered_saver:
-          raise NotImplementedError(
-              "Loading a SavedModel that uses registered checkpoint saver is "
-              f"not supported in graph mode. The loaded object {obj} uses the "
-              f"saver registered with the name {registered_saver}.")
+    if all_initialized_models != set(self.model_layer_dependencies.keys()):
+      # This should not happen.
+      uninitialized_model_ids = (
+          set(self.model_layer_dependencies.keys()) - all_initialized_models)
+      uninitialized_model_names = [
+          self.model_layer_dependencies[model_id][0].name
+          for model_id in uninitialized_model_ids]
+      raise ValueError('Error when loading from SavedModel -- the following '
+                       'models could not be initialized: {}'
+                       .format(uninitialized_model_names))
 
-        restore_ops = position.restore_ops(reader)
-        if restore_ops:
-          if resource_variable_ops.is_resource_variable(obj):
-            if len(restore_ops) == 1:
-              obj._initializer_op = restore_ops[0]
-            else:
-              obj._initializer_op = control_flow_ops.group(*restore_ops)
-          elif (isinstance(obj, lookup_ops.LookupInterface) or
-                isinstance(obj, resource.CapturableResource)):
-            # We don't need to check for eager execution here, since this code
-            # path should only be taken if we are restoring in graph mode.
-            ops.add_to_collection(ops.GraphKeys.TABLE_INITIALIZERS, restore_ops)
-          else:
-            raise NotImplementedError(
-                f"Unable to restore state of object {obj} from the checkpoint.")
+  def _reconstruct_model(self, model_id, model, layers):
+    """Reconstructs the network structure."""
+    config = json_utils.decode(self._metadata[model_id].metadata)['config']
 
-  def adjust_debug_info_func_names(self, debug_info):
-    """Rewrite func names in the debug info by using the concrete func names."""
-    output_debug_info = graph_debug_info_pb2.GraphDebugInfo()
-    output_debug_info.files[:] = debug_info.files
-    # TODO: b/292007261 - Read name_to_trace_id as well as traces
-    for key in debug_info.traces:
-      node, func = key.split("@")
-      new_func = ""
-      if func in self._concrete_functions:
-        new_func = self._concrete_functions[func].function_def.signature.name
-      output_debug_info.traces[node + "@" + new_func].CopyFrom(
-          debug_info.traces[key])
-    return output_debug_info
-
-  def get(self, node_id):
-    if isinstance(node_id, str):
-      node_id = self._node_path_to_id[node_id]
-    return self._nodes[node_id]
-
-  def _recreate(self, proto, node_id, nodes):
-    """Creates a Python object from a SavedObject protocol buffer.
-
-    Args:
-      proto: a SavedObject proto
-      node_id: int, the index of this object in the SavedObjectGraph node list.
-      nodes: dict mapping int node_ids -> created objects.
-
-    Returns:
-      The recreated object, and the set-attribute function for reconnecting
-      the trackable children.
-    """
-    registered_class = registration.get_registered_class(proto.registered_name)
-    if registered_class is None:
-      registered_class = _BUILT_IN_REGISTRATIONS.get(proto.WhichOneof("kind"))
-
-    dependencies = {}
-    for key, dep_node_id in self._get_node_dependencies(proto).items():
-      dependencies[key] = nodes[dep_node_id]
-
-    if registered_class:
-      obj = registered_class._deserialize_from_proto(  # pylint: disable=protected-access
-          proto=proto.serialized_user_proto,
-          object_proto=proto,
-          dependencies=dependencies,
-          export_dir=self._export_dir,
-          asset_file_def=self._asset_file_def,
-          operation_attributes=self._operation_attributes)
-      if isinstance(obj, base.Trackable):
-        setter = type(obj)._add_trackable_child  # pylint: disable=protected-access
-      else:
-        # Returned object may be non-Trackable (e.g. when restoring captures).
-        setter = setattr
-      return obj, setter
-    else:
-      return self._recreate_default(proto, node_id, dependencies)
-
-  def _recreate_default(self, proto, node_id, deps):
-    """Creates a Python object from a SavedObject protocol buffer."""
-    factory = {
-        "user_object": (
-            lambda: self._recreate_user_object(proto.user_object, node_id)),
-        "function": lambda: self._recreate_function(proto.function, deps),
-        "bare_concrete_function": functools.partial(
-            self._recreate_bare_concrete_function,
-            proto=proto.bare_concrete_function, dependencies=deps),
-        "variable": lambda: self._recreate_variable(proto.variable),
-        "captured_tensor": functools.partial(
-            self._get_tensor_from_fn, proto.captured_tensor),
-    }
-    kind = proto.WhichOneof("kind")
-    if kind not in factory:
-      raise ValueError(f"Unknown SavedObject type: {kind}. Expected one of "
-                       f"{list(factory.keys())}.")
-    return factory[kind]()
-
-  def _recreate_user_object(self, proto, node_id):
-    """Instantiates a SavedUserObject."""
-    if proto.identifier == "optimizer":
-      # Make sure that the Keras optimizers module is imported. This is needed
-      # to be able to load the "optimizer" object (OptimizerV2), which has
-      # special logic around adding slot variables with `add_slot` in this file.
-      try:
-        import tf_keras  # pylint: disable=g-import-not-at-top,unused-import
-        try:
-          import tf_keras.optimizers.legacy as _  # pylint: disable=g-import-not-at-top
-        except ImportError:
-          try:
-            import tf_keras.optimizers.optimizer_v2 as _  # pylint: disable=g-import-not-at-top
-          except ImportError as e:
-            raise ImportError(
-                "Error when importing Keras. Unable to load SavedModel that "
-                "contains an optimizer without the Keras module.") from e
-      except ImportError:
-        try:
-          import keras.optimizers.legacy as _  # pylint: disable=g-import-not-at-top
-        except ImportError:
-          try:
-            import keras.optimizers.optimizer_v2 as _  # pylint: disable=g-import-not-at-top
-          except ImportError as e:
-            raise ImportError(
-                "Error when importing Keras. Unable to load SavedModel that "
-                "contains an optimizer without the Keras module.") from e
-    looked_up = revived_types.deserialize(proto)
-    if looked_up is None:
-      return self._recreate_base_user_object(proto, node_id)
-    return looked_up
-
-  def _recreate_base_user_object(self, proto=None, node_id=None):
-    del proto, node_id
-    # Note: each user object has its own class. This allows making each one
-    # individually callable by adding a `__call__` method to the classes of
-    # the objects instances that have a `__call__` property.
-
-    class _UserObject(autotrackable.AutoTrackable):
+    # Set up model inputs
+    if model.inputs:
+      # Inputs may already be created if the model is instantiated in another
+      # object's __init__.
       pass
+    elif isinstance(model, models_lib.Sequential):
+      if not layers or not isinstance(layers[0], input_layer.InputLayer):
+        if config['layers'][0]['class_name'] == 'InputLayer':
+          layers.insert(0, input_layer.InputLayer.from_config(
+              config['layers'][0]['config']))
+        elif 'batch_input_shape' in config['layers'][0]['config']:
+          batch_input_shape = config['layers'][0]['config']['batch_input_shape']
+          layers.insert(0, input_layer.InputLayer(
+              input_shape=batch_input_shape[1:],
+              batch_size=batch_input_shape[0],
+              dtype=layers[0].dtype,
+              name=layers[0].name + '_input'))
+      model.__init__(layers, name=config['name'])
+      if not model.inputs:
+        first_layer = self._get_child_layer_node_ids(model_id)[0]
+        input_specs = self._infer_inputs(first_layer)
+        input_shapes = self._infer_inputs(first_layer, convert_to_shapes=True)
+        model._set_inputs(input_specs)  # pylint: disable=protected-access
+        if not model.built and not isinstance(input_specs, dict):
+          model.build(input_shapes)
+    else:  # Reconstruct functional model
+      (inputs, outputs,
+       created_layers) = functional_lib.reconstruct_from_config(
+           config, created_layers={layer.name: layer for layer in layers})
+      model.__init__(inputs, outputs, name=config['name'])
+      functional_lib.connect_ancillary_layers(model, created_layers)
 
-    return _UserObject(), setattr
+    # Set model dtype.
+    _set_network_attributes_from_metadata(model)
 
-  def _recreate_function(self, proto, dependencies):
-    fn = function_deserialization.recreate_function(
-        proto, self._concrete_functions)
-    for name in proto.concrete_functions:
-      self._setup_function_captures(name, dependencies)
+    # Unblock models that are dependent on this model.
+    self._unblock_model_reconstruction(model_id, model)
 
-    # If the list of concrete functions associated with this polymorphic
-    # restored function is identical to a list of concrete functions found in
-    # the function alias mapping, we replace the latter with this restored
-    # function. Also see comments in the __init__ method.
-    if self._save_options.experimental_load_function_aliases:
-      if proto.concrete_functions and all(
-          name in self._concrete_function_aliases
-          for name in proto.concrete_functions
-      ):
-        alias = self._concrete_function_aliases[
-            next(iter(proto.concrete_functions))
-        ]
-        aliased = self.function_aliases.get(alias)
-        assert isinstance(aliased, list)
-        # Note that we cannot compare f.name below with proto.concrete_functions
-        # because the former is new name for the restored ConcreteFunction
-        # object while the latter is the old name in the original proto.
-        if set(f.name for f in aliased) == set(
-            f.name for f in fn._list_all_concrete_functions()  # pylint: disable=protected-access
-        ):
-          self.function_aliases[alias] = fn
-        else:
-          logging.warn(
-              (
-                  "Not aliasing '%s' to polymorphic restored function because"
-                  " of mismatched concrete functions: %s vs %s"
-              ),
-              alias,
-              set(f.name for f in aliased),
-              set(f.name for f in fn._list_all_concrete_functions()),  # pylint: disable=protected-access
-          )
+  def _get_child_layer_node_ids(self, node_id):
+    """Returns the node ids of each layer in a Sequential/Functional model."""
+    # Sequential and Functional track layers with names following the format
+    # "layer-N". Use this to generate the list of layers.
+    num_layers = 0
+    child_layers = {}
+    pattern = re.compile('layer-(\\d+)')
 
-    return fn, setattr
+    for child in self._proto.nodes[node_id].children:
+      m = pattern.match(child.local_name)
+      if m is None:
+        continue
+      layer_n = int(m.group(1))
+      num_layers = max(layer_n + 1, num_layers)
+      child_layers[layer_n] = child.node_id
 
-  def _recreate_bare_concrete_function(self, proto, dependencies):
-    fn = function_deserialization.setup_bare_concrete_function(
-        proto, self._concrete_functions)
-    self._setup_function_captures(proto.concrete_function_name, dependencies)
-    return fn, setattr
+    ordered = []
+    for n in range(num_layers):
+      child = child_layers.get(n)
+      if child is None:
+        break
+      ordered.append(child)
+    return ordered
 
-  def _recreate_variable(self, proto):
-    name = proto.name if proto.name else None
-    if name is not None:
-      dbg_name = name
+  def _search_for_child_node(self, parent_id, path_to_child):
+    """Returns node id of child node.
+
+    A helper method for traversing the object graph proto.
+
+    As an example, say that the object graph proto in the SavedModel contains an
+    object with the following child and grandchild attributes:
+
+    `parent.child_a.child_b`
+
+    This method can be used to retrieve the node id of `child_b` using the
+    parent's node id by calling:
+
+    `_search_for_child_node(parent_id, ['child_a', 'child_b'])`.
+
+    Args:
+      parent_id: node id of parent node
+      path_to_child: list of children names.
+
+    Returns:
+      node_id of child, or None if child isn't found.
+    """
+    if not path_to_child:
+      return parent_id
+
+    for child in self._proto.nodes[parent_id].children:
+      if child.local_name == path_to_child[0]:
+        return self._search_for_child_node(child.node_id, path_to_child[1:])
+    return None
+
+  def _infer_inputs(self, layer_node_id, convert_to_shapes=False):
+    """Infers input shape of layer from SavedModel functions."""
+    call_fn_id = self._search_for_child_node(
+        layer_node_id, ['call_and_return_all_conditional_losses'])
+    if call_fn_id is None:
+      return None
+
+    concrete_functions = (
+        self._proto.nodes[call_fn_id].function.concrete_functions)
+    if not concrete_functions:
+      return None
+    call_fn_name = concrete_functions[0]
+    call_fn_proto = self._proto.concrete_functions[call_fn_name]
+    structured_input_signature = nested_structure_coder.decode_proto(
+        call_fn_proto.canonicalized_input_signature)
+    inputs = structured_input_signature[0][0]
+    if convert_to_shapes:
+      return nest.map_structure(lambda spec: spec.shape, inputs)
     else:
-      dbg_name = "<variable loaded from saved model>"
-    synchronization, aggregation, trainable = (
-        variables.validate_synchronization_aggregation_trainable(
-            proto.synchronization, proto.aggregation, proto.trainable,
-            name=dbg_name))
+      return inputs
 
-    def uninitialized_variable_creator(next_creator, **kwargs):
-      """A variable creator that creates uninitialized variables."""
-      del next_creator
-      return resource_variable_ops.UninitializedVariable(**kwargs)
-
-    # Create a variable_creator_scope that creates uninitialized variables with
-    # a lower priority such that a potential distributed variable_creator_scope
-    # can take precedence.
-    with ops.get_default_graph()._variable_creator_scope(  # pylint: disable=protected-access
-        uninitialized_variable_creator,
-        priority=50):
-      saved_device = proto.device
-      load_with_device = (
-          self._save_options.experimental_variable_policy
-          ._save_variable_devices() and config.get_soft_device_placement() and
-          saved_device)
-      if load_with_device:
-        with ops.device(saved_device):
-          return variables.Variable(
-              shape=proto.shape,
-              dtype=proto.dtype,
-              name=name,
-              trainable=trainable,
-              synchronization=synchronization,
-              aggregation=aggregation), setattr
-      else:
-        return variables.Variable(
-            shape=proto.shape,
-            dtype=proto.dtype,
-            name=name,
-            trainable=trainable,
-            synchronization=synchronization,
-            aggregation=aggregation), setattr
-
-  def _get_tensor_from_fn(self, proto):
-    outer_graph = self._concrete_functions[proto.concrete_function].graph
-    captured_tensor = outer_graph.get_tensor_by_name(proto.name)
-    return captured_tensor, setattr
+  def _config_node_setter(self, setter):
+    """Creates edges for nodes that are recreated from config."""
+    def setattr_wrapper(obj, name, value):
+      # Avoid overwriting attributes of objects recreated from the config.
+      if obj._lookup_dependency(name) is None:  # pylint: disable=protected-access
+        setter(obj, name, value)
+    return setattr_wrapper
 
 
-def _call_attribute(instance, *args, **kwargs):
-  return instance.__call__(*args, **kwargs)
+def _finalize_saved_model_layers(layers):
+  """Runs the final steps of loading Keras Layers from SavedModel."""
+  # pylint: disable=protected-access
+  # 1. Set up call functions for all layers initialized from the SavedModel (
+  # and not the config)
+  for layer in layers:
+    layer.built = True
+    layer_call = getattr(_get_keras_attr(layer),
+                         'call_and_return_conditional_losses', None)
+    if layer_call and layer_call.concrete_functions:
+      layer.call = utils.use_wrapped_call(
+          layer, layer_call, return_method=True)
+      expects_training_arg = layer._serialized_attributes['metadata'][
+          'expects_training_arg']
+      if 'training' in layer_call.function_spec.arg_names:
+        # This could change the value of `expects_training_arg` if this layer
+        # doesn't expect a training arg, but has a child layer that does.
+        expects_training_arg = True
+      layer._init_call_fn_args(expects_training_arg)
+    else:
+      layer.call = types.MethodType(
+          _unable_to_call_layer_due_to_serialization_issue, layer)
+
+  for layer in layers:
+    # 2. Set model inputs and outputs.
+    if isinstance(layer, RevivedNetwork):
+      _set_network_attributes_from_metadata(layer)
+
+      if hasattr(_get_keras_attr(layer), 'call_and_return_conditional_losses'):
+        call_fn = _get_keras_attr(layer).call_and_return_conditional_losses
+        if not call_fn.concrete_functions:
+          continue
+        if call_fn.input_signature is None:
+          inputs = infer_inputs_from_restored_call_function(call_fn)
+        else:
+          inputs = call_fn.input_signature[0]
+        layer._set_inputs(inputs)  # pylint: disable=protected-access
+
+    # 3. Add losses that aren't generated by the layer.call function.
+    _restore_layer_unconditional_losses(layer)
+    _restore_layer_activation_loss(layer)
+
+    # 4. Restore metrics list
+    _restore_layer_metrics(layer)
+
+  # pylint: enable=protected-access
 
 
-@tf_export("saved_model.load", v1=["saved_model.load_v2"])
-def load(export_dir, tags=None, options=None):
-  """Load a SavedModel from `export_dir`.
+def _unable_to_call_layer_due_to_serialization_issue(
+    layer, *unused_args, **unused_kwargs):
+  """Replaces the `layer.call` if the layer was not fully serialized.
 
-  Signatures associated with the SavedModel are available as functions:
+  Keras Model/Layer serialization is relatively relaxed because SavedModels
+  are not always loaded back as keras models. Thus, when there is an issue
+  tracing a non-signature function, a warning is logged instead of raising an
+  error. This results in a SavedModel where the model's call function is saved,
+  but the internal layer call functions are not.
 
-  ```python
-  imported = tf.saved_model.load(path)
-  f = imported.signatures["serving_default"]
-  print(f(x=tf.constant([[1.]])))
-  ```
-
-  Objects exported with `tf.saved_model.save` additionally have trackable
-  objects and functions assigned to attributes:
-
-  ```python
-  exported = tf.train.Checkpoint(v=tf.Variable(3.))
-  exported.f = tf.function(
-      lambda x: exported.v * x,
-      input_signature=[tf.TensorSpec(shape=None, dtype=tf.float32)])
-  tf.saved_model.save(exported, path)
-  imported = tf.saved_model.load(path)
-  assert 3. == imported.v.numpy()
-  assert 6. == imported.f(x=tf.constant(2.)).numpy()
-  ```
-
-  _Loading Keras models_
-
-  Keras models are trackable, so they can be saved to SavedModel. The object
-  returned by `tf.saved_model.load` is not a Keras object (i.e. doesn't have
-  `.fit`, `.predict`, etc. methods). A few attributes and functions are still
-  available: `.variables`, `.trainable_variables` and `.__call__`.
-
-  ```python
-  model = tf.keras.Model(...)
-  tf.saved_model.save(model, path)
-  imported = tf.saved_model.load(path)
-  outputs = imported(inputs)
-  ```
-
-  Use `tf.keras.models.load_model` to restore the Keras model.
-
-  _Importing SavedModels from TensorFlow 1.x_
-
-  1.x SavedModels APIs have a flat graph instead of `tf.function` objects.
-  These SavedModels will be loaded with the following attributes:
-
-  * `.signatures`: A dictionary mapping signature names to functions.
-  * `.prune(feeds, fetches) `: A method which allows you to extract
-    functions for new subgraphs. This is equivalent to importing the SavedModel
-    and naming feeds and fetches in a Session from TensorFlow 1.x.
-
-    ```python
-    imported = tf.saved_model.load(path_to_v1_saved_model)
-    pruned = imported.prune("x:0", "out:0")
-    pruned(tf.ones([]))
-    ```
-
-    See `tf.compat.v1.wrap_function` for details.
-  * `.variables`: A list of imported variables.
-  * `.graph`: The whole imported graph.
-  * `.restore(save_path)`: A function that restores variables from a checkpoint
-    saved from `tf.compat.v1.Saver`.
-
-  _Consuming SavedModels asynchronously_
-
-  When consuming SavedModels asynchronously (the producer is a separate
-  process), the SavedModel directory will appear before all files have been
-  written, and `tf.saved_model.load` will fail if pointed at an incomplete
-  SavedModel. Rather than checking for the directory, check for
-  "saved_model_dir/saved_model.pb". This file is written atomically as the last
-  `tf.saved_model.save` file operation.
+  When deserialized with `tf.keras.models.load_model`, the internal layers
+  which do not have serialized call functions should raise an error when called.
 
   Args:
-    export_dir: The SavedModel directory to load from.
-    tags: A tag or sequence of tags identifying the MetaGraph to load. Optional
-      if the SavedModel contains a single MetaGraph, as for those exported from
-      `tf.saved_model.save`.
-    options: `tf.saved_model.LoadOptions` object that specifies options for
-      loading.
-
-  Returns:
-    A trackable object with a `signatures` attribute mapping from signature
-    keys to functions. If the SavedModel was exported by `tf.saved_model.save`,
-    it also points to trackable objects, functions, debug info which it has been
-    saved.
+    layer: Layer without the serialized call function.
 
   Raises:
-    ValueError: If `tags` don't match a MetaGraph in the SavedModel.
+    ValueError
   """
-  if isinstance(export_dir, os.PathLike):
-    export_dir = os.fspath(export_dir)
-  result = load_partial(export_dir, None, tags, options)["root"]
-  return result
+
+  raise ValueError(
+      'Cannot call custom layer {} of type {}, because the call function was '
+      'not serialized to the SavedModel.'
+      'Please try one of the following methods to fix this issue:'
+      '\n\n(1) Implement `get_config` and `from_config` in the layer/model '
+      'class, and pass the object to the `custom_objects` argument when '
+      'loading the model. For more details, see: '
+      'https://www.tensorflow.org/guide/keras/save_and_serialize'
+      '\n\n(2) Ensure that the subclassed model or layer overwrites `call` '
+      'and not `__call__`. The input shape and dtype will be automatically '
+      'recorded when the object is called, and used when saving. To manually '
+      'specify the input shape/dtype, decorate the call function with '
+      '`@tf.function(input_signature=...)`.'.format(layer.name, type(layer)))
 
 
-@tf_export("__internal__.saved_model.load_partial", v1=[])
-def load_partial(export_dir, filters, tags=None, options=None):
-  """Partially load a SavedModel (saved from V2).
+def _finalize_config_layers(layers):
+  """Runs the final steps of loading Keras Layers from config."""
+  for layer in layers:
+    # It is assumed that layers define their unconditional losses after being
+    # recreated from the config and built. The exceptions to this
+    # are Functional and Sequential models, which only store conditional losses
+    # (losses dependent on the inputs) in the config. Unconditional losses like
+    # weight regularization must be revived from the SavedModel.
+    if _is_graph_network(layer):
+      _restore_layer_unconditional_losses(layer)
 
-  Similar to `tf.saved_model.load`, but with an additional argument that
-  lets you specify which nodes to load.
-  `tf.saved_model.load_partial(export_dir, ["root"])` and
-  `tf.saved_model.load(export_dir)` are equivalent.
+    # Some layers, like Dense, record their activation loss function in the
+    # config. However, not all layers do this, so the activation loss may be
+    # missing when restored from the config/hdf5.
+    # TODO(kathywu): Investigate ways to improve the config to ensure consistent
+    # loading behavior between HDF5 and SavedModel.
+    _restore_layer_activation_loss(layer)
 
-  Note: This only works for SavedModels saved with TensorFlow V2 from
-  `tf.saved_model.save` or Keras.
+    # Restore metrics list.
+    _restore_layer_metrics(layer)
 
-  In Tensorflow V2, SavedModel stores the **object graph** of the saved object.
-  The graph contains nodes (`tf.Module`, `tf.Variable`, `tf.function`, Keras
-  layers, etc.) and edges that are the name of the attributes connecting the
-  objects.
+    # Restore RNN layer states.
+    if (isinstance(layer, recurrent.RNN) and
+        layer.stateful and
+        hasattr(_get_keras_attr(layer), 'states')):
+      layer.states = getattr(_get_keras_attr(layer), 'states', None)
+      for variable in nest.flatten(layer.states):
+        backend.track_variable(variable)
 
-  *Example 1*
+    # Perform any layer defined finalization of the layer state.
+    layer.finalize_state()
 
-  ```
-  model = tf.Module()
-  model.child_layer = tf.Module()
-  model.child_layer.v = tf.Variable(5.)
-  tf.saved_model.save(model, '/tmp/model')
-  loaded = tf.__internal__.saved_model.load_partial(
-  ...   '/tmp/model',
-  ...   ['root.child_layer', 'root.child_layer.v'])
-  loaded['root.child_layer'].v.numpy()
-  5.
-  loaded['root.child_layer'].v is loaded['root.child_layer.v']
-  True
 
-  *Example 2*
-  model = tf.Module()
-  model.child_layer = tf.Module()
-  model.child_layer.v = tf.Variable(5.)
-  >>>
-  tf.saved_model.save(model, '/tmp/model')
-  # Create a variable
-  new_variable = tf.Variable(0.)
-  loaded = tf.__internal__.saved_model.load_partial(
-  ...   '/tmp/model',
-  ...   {'root.child_layer': None, 'root.child_layer.v': new_variable})
-  loaded['root.child_layer'].v.numpy()
-  5.
-  new_variable.numpy()
-  5.
-  ```
+def _finalize_metric(metric):
+  metric.update_state = types.MethodType(metrics_utils.update_state_wrapper(
+      metric.keras_api.update_state), metric)
+  metric.result = metric.keras_api.result
 
-  **Loading under different distribution strategies**
-  You can load different parts of the model under different distribution
-  strategies. Note that this is very experimental so use with care.
 
-  ```
-  model = tf.Module()
-  model.layer_1 = tf.Module()
-  model.layer_1.v = tf.Variable(5.)
-  model.layer_2 = tf.Module()
-  model.layer_2.v = tf.Variable(7.)
-  tf.saved_model.save(model, '/tmp/model')
-  # Load with no strategy
-  loaded = tf.__internal__.saved_model.load_partial(
-  ...   '/tmp/model',
-  ...   ['root.layer_1'])
-  loaded['root.layer_1'].v
-  <tf.Variable 'Variable:0' shape=() dtype=float32, numpy=5.0>
-  strategy = tf.distribute.MirroredStrategy()
-  with strategy.scope():
-  ...   loaded2 = tf.__internal__.saved_model.load_partial(
-  ...     '/tmp/model',
-  ...     ['root.layer_2'])
-  loaded2['root.layer_2'].v
-  MirroredVariable:{
-      0: <tf.Variable 'Variable:0' shape=() dtype=float32, numpy=7.0>
+def _restore_layer_unconditional_losses(layer):
+  """Restore unconditional losses from SavedModel."""
+  if hasattr(_get_keras_attr(layer), 'layer_regularization_losses'):
+    losses = getattr(_get_keras_attr(layer), 'layer_regularization_losses', [])
+  else:
+    # Some earlier SavedModels may not have layer_regularization_losses
+    # serialized separately. Fall back to using the regularization_losses
+    # list if it does not exist.
+    losses = layer._serialized_attributes.get('regularization_losses', [])  # pylint: disable=protected-access
+  for loss in losses:
+    layer.add_loss(loss)
+
+
+def _restore_layer_activation_loss(layer):
+  """Restore actiation loss from SavedModel."""
+  # Use wrapped activity regularizer function if the layer's activity
+  # regularizer wasn't created during initialization.
+  activity_regularizer = getattr(_get_keras_attr(layer),
+                                 'activity_regularizer_fn', None)
+  if activity_regularizer and not layer.activity_regularizer:
+    try:
+      layer.activity_regularizer = activity_regularizer
+    except AttributeError:
+      # This may happen if a layer wrapper is saved with an activity
+      # regularizer. The wrapper object's activity regularizer is unsettable.
+      pass
+
+
+def revive_custom_object(identifier, metadata):
+  """Revives object from SavedModel."""
+  if ops.executing_eagerly_outside_functions():
+    model_class = training_lib.Model
+  else:
+    model_class = training_lib_v1.Model
+
+  revived_classes = {
+      constants.INPUT_LAYER_IDENTIFIER: (
+          RevivedInputLayer, input_layer.InputLayer),
+      constants.LAYER_IDENTIFIER: (RevivedLayer, base_layer.Layer),
+      constants.MODEL_IDENTIFIER: (RevivedNetwork, model_class),
+      constants.NETWORK_IDENTIFIER: (RevivedNetwork, functional_lib.Functional),
+      constants.SEQUENTIAL_IDENTIFIER: (RevivedNetwork, models_lib.Sequential),
   }
-  ```
+  parent_classes = revived_classes.get(identifier, None)
+
+  if parent_classes is not None:
+    parent_classes = revived_classes[identifier]
+    revived_cls = type(
+        compat.as_str(metadata['class_name']), parent_classes, {})
+    return revived_cls._init_from_metadata(metadata)  # pylint: disable=protected-access
+  else:
+    raise ValueError('Unable to restore custom object of type {} currently. '
+                     'Please make sure that the layer implements `get_config`'
+                     'and `from_config` when saving. In addition, please use '
+                     'the `custom_objects` arg when calling `load_model()`.'
+                     .format(identifier))
+
+
+def _restore_layer_metrics(layer):
+  metrics_list = getattr(_get_keras_attr(layer), 'layer_metrics', {})
+  layer_metrics = {m.name: m for m in layer._metrics}  # pylint: disable=protected-access
+  for name, metric in metrics_list.items():
+    if name not in layer_metrics:
+      # Metrics may be added during initialization/building of custom layers.
+      layer._metrics.append(metric)  # pylint: disable=protected-access
+
+
+# TODO(kathywu): Centrally define keys and functions for both  serialization and
+# deserialization.
+class RevivedLayer(object):
+  """Keras layer loaded from a SavedModel."""
+
+  @classmethod
+  def _init_from_metadata(cls, metadata):
+    """Create revived layer from metadata stored in the SavedModel proto."""
+    init_args = dict(
+        name=metadata['name'],
+        trainable=metadata['trainable'])
+    if metadata.get('dtype') is not None:
+      init_args['dtype'] = metadata['dtype']
+    if metadata.get('batch_input_shape') is not None:
+      init_args['batch_input_shape'] = metadata['batch_input_shape']
+
+    revived_obj = cls(**init_args)
+
+    with utils.no_automatic_dependency_tracking_scope(revived_obj):
+      # pylint:disable=protected-access
+      revived_obj._expects_training_arg = metadata['expects_training_arg']
+      config = metadata.get('config')
+      if generic_utils.validate_config(config):
+        revived_obj._config = config
+      if metadata.get('input_spec') is not None:
+        revived_obj.input_spec = recursively_deserialize_keras_object(
+            metadata['input_spec'],
+            module_objects={'InputSpec': input_spec.InputSpec})
+      if metadata.get('activity_regularizer') is not None:
+        revived_obj.activity_regularizer = regularizers.deserialize(
+            metadata['activity_regularizer'])
+      if metadata.get('_is_feature_layer') is not None:
+        revived_obj._is_feature_layer = metadata['_is_feature_layer']
+      if metadata.get('stateful') is not None:
+        revived_obj.stateful = metadata['stateful']
+      # pylint:enable=protected-access
+
+    return revived_obj, _revive_setter
+
+  @property
+  def keras_api(self):
+    return self._serialized_attributes.get(constants.KERAS_ATTR, None)
+
+  def get_config(self):
+    if hasattr(self, '_config'):
+      return self._config
+    else:
+      raise NotImplementedError
+
+
+def _revive_setter(layer, name, value):
+  """Setter function that saves some attributes to separate dictionary."""
+  # Many attributes in the SavedModel conflict with properties defined in
+  # Layer and Model. Save these attributes to a separate dictionary.
+  if name in PUBLIC_ATTRIBUTES:
+    # pylint: disable=protected-access
+    if isinstance(value, trackable.Trackable):
+      layer._track_trackable(value, name=name)
+    layer._serialized_attributes[name] = value
+    # pylint: enable=protected-access
+  elif (isinstance(layer, functional_lib.Functional) and
+        re.match(r'^layer(_with_weights)?-[\d+]', name) is not None):
+    # Edges named "layer-n" or "layer_with_weights-n", which are tracked in
+    # network._track_layers, should not be added as an attribute. They should
+    # be temporarily added as a dependency so that checkpointed values can be
+    # restored. These dependencies are manually deleted in
+    # KerasObjectLoader.del_tracking.
+
+    # Set `overwrite=True` in the case that `layer` already tracks a different
+    # layer-n. This may cause variable values to not be loaded properly in the
+    # original layer-n, but we already warn the users about this
+    # (ctrl-f "shared between different layers/models").
+    layer._track_trackable(value, name, overwrite=True)  # pylint: disable=protected-access
+  elif getattr(layer, name, None) is not None:
+    # Don't overwrite already defined attributes.
+    pass
+  else:
+    setattr(layer, name, value)
+
+
+class RevivedInputLayer(object):
+  """InputLayer loaded from a SavedModel."""
+
+  @classmethod
+  def _init_from_metadata(cls, metadata):
+    """Revives the saved InputLayer from the Metadata."""
+    init_args = dict(
+        name=metadata['name'],
+        dtype=metadata['dtype'],
+        sparse=metadata['sparse'],
+        ragged=metadata['ragged'],
+        batch_input_shape=metadata['batch_input_shape'])
+    revived_obj = cls(**init_args)
+    with utils.no_automatic_dependency_tracking_scope(revived_obj):
+      revived_obj._config = metadata['config']  # pylint:disable=protected-access
+
+    return revived_obj, setattr
+
+  def get_config(self):
+    return self._config
+
+
+def recursively_deserialize_keras_object(config, module_objects=None):
+  """Deserialize Keras object from a nested structure."""
+  if isinstance(config, dict):
+    if 'class_name' in config:
+      return generic_utils.deserialize_keras_object(
+          config, module_objects=module_objects)
+    else:
+      return {key: recursively_deserialize_keras_object(config[key],
+                                                        module_objects)
+              for key in config}
+  if isinstance(config, (tuple, list)):
+    return [recursively_deserialize_keras_object(x, module_objects)
+            for x in config]
+  else:
+    raise ValueError('Unable to decode config: {}'.format(config))
+
+
+def get_common_shape(x, y):
+  """Find a `TensorShape` that is compatible with both `x` and `y`."""
+  if x is None != y is None:
+    raise RuntimeError(
+        'Cannot find a common shape when LHS shape is None but RHS shape '
+        'is not (or vice versa): %s vs. %s' % (x, y))
+  if x is None:
+    return None  # The associated input was not a Tensor, no shape generated.
+  if not isinstance(x, tensor_shape.TensorShape):
+    raise TypeError('Expected x to be a TensorShape but saw %s' % (x,))
+  if not isinstance(y, tensor_shape.TensorShape):
+    raise TypeError('Expected y to be a TensorShape but saw %s' % (y,))
+  if x.rank != y.rank or x.rank is None:
+    return tensor_shape.TensorShape(None)
+  dims = []
+  for dim_x, dim_y in zip(x.dims, y.dims):
+    if (dim_x != dim_y
+        or tensor_shape.dimension_value(dim_x) is None
+        or tensor_shape.dimension_value(dim_y) is None):
+      dims.append(None)
+    else:
+      dims.append(tensor_shape.dimension_value(dim_x))
+  return tensor_shape.TensorShape(dims)
+
+
+def infer_inputs_from_restored_call_function(fn):
+  """Returns TensorSpec of inputs from a restored call function.
 
   Args:
-    export_dir: The SavedModel directory to load from.
-    filters: A list or dictionary where each element or key is a string
-      path to nodes that should be loaded. Node paths consist of all the child
-      attribute names to reach that node in the form: `root.{attribute_name}`.
-      The loader will load all of the specified nodes and their recursive
-      descendants. When this option is defined, the loader will return a
-      dictionary mapping the node paths to the loaded objects.
-    tags: A tag or sequence of tags identifying the MetaGraph to load. Optional
-      if the SavedModel contains a single MetaGraph, as for those exported from
-      `tf.saved_model.save`.
-    options: `tf.saved_model.LoadOptions` object that specifies options for
-      loading.
+    fn: Restored layer call function. It is assumed that `fn` has at least
+        one concrete function and that the inputs are in the first argument.
 
   Returns:
-    A dictionary mapping node paths from the filter to loaded objects.
+    TensorSpec of call function inputs.
   """
-  options = options or load_options.LoadOptions()
-  if tags is not None and not isinstance(tags, set):
-    # Supports e.g. tags=SERVING and tags=[SERVING]. Sets aren't considered
-    # sequences for nest.flatten, so we put those through as-is.
-    tags = nest.flatten(tags)
-  saved_model_proto, debug_info = (
-      loader_impl.parse_saved_model_with_debug_info(export_dir))
+  def common_spec(x, y):
+    common_shape = get_common_shape(x.shape, y.shape)
+    if isinstance(x, sparse_tensor.SparseTensorSpec):
+      return sparse_tensor.SparseTensorSpec(common_shape, x.dtype)
+    elif isinstance(x, ragged_tensor.RaggedTensorSpec):
+      return ragged_tensor.RaggedTensorSpec(common_shape, x.dtype)
+    return tensor_spec.TensorSpec(common_shape, x.dtype, x.name)
 
-  loader = None
-  if (len(saved_model_proto.meta_graphs) == 1 and
-      saved_model_proto.meta_graphs[0].HasField("object_graph_def")):
-    metrics.IncrementReadApi(_LOAD_V2_LABEL)
-    meta_graph_def = saved_model_proto.meta_graphs[0]
-    # tensor_content field contains raw bytes in litle endian format
-    # which causes problems when loaded on big-endian systems
-    # requiring byteswap
-    if sys.byteorder == "big":
-      saved_model_utils.swap_function_tensor_content(meta_graph_def, "little",
-                                                     "big")
-    if (tags is not None
-        and set(tags) != set(meta_graph_def.meta_info_def.tags)):
-      raise ValueError(
-          f"Got an incompatible argument to `tags`: {tags}. The SavedModel at "
-          f"{export_dir} has one MetaGraph with tags "
-          f"{meta_graph_def.meta_info_def.tags}. You may omit the argument, "
-          "pass 'None', or pass matching tags.")
-    object_graph_proto = meta_graph_def.object_graph_def
-
-    ckpt_options = checkpoint_options.CheckpointOptions(
-        experimental_io_device=options.experimental_io_device)
-    with ops.init_scope():
-      try:
-        loader = Loader(object_graph_proto, saved_model_proto, export_dir,
-                        ckpt_options, options, filters)
-      except errors.NotFoundError as err:
-        raise FileNotFoundError(
-            str(err) + "\n You may be trying to load on a different device "
-            "from the computational device. Consider setting the "
-            "`experimental_io_device` option in `tf.saved_model.LoadOptions` "
-            "to the io_device such as '/job:localhost'.")
-      root = loader.get(0)
-      root.graph_debug_info = loader.adjust_debug_info_func_names(debug_info)
-    root.tensorflow_version = meta_graph_def.meta_info_def.tensorflow_version
-    root.tensorflow_git_version = (
-        meta_graph_def.meta_info_def.tensorflow_git_version)
-    metrics.IncrementRead(write_version="2")
-
-    if options.experimental_load_function_aliases:
-      if hasattr(root, "function_aliases"):
-        raise ValueError(
-            "Could not load with experimental_load_function_aliases option"
-            " because the top-level object already has an attributed with name"
-            " 'function_aliases'"
-        )
-      root.function_aliases = loader.function_aliases
-  else:
-    if filters:
-      raise ValueError("SavedModels saved from Tensorflow 1.x) cannot be "
-                       "loaded with node filters.")
-    with ops.init_scope():
-      root = load_v1_in_v2.load(
-          export_dir, tags, options.experimental_skip_checkpoint
-      )
-      root.graph_debug_info = debug_info
-  # For privacy concerns, please see the note in
-  #  tensorflow/cc/saved_model/metrics.h
-  metrics.SetReadPath(saved_model_path=str(export_dir))
-
-  # Read and log SavedModel checksum, if it is nonzero.
-  try:
-    fingerprint = fingerprinting.read_fingerprint(export_dir)
-  except FileNotFoundError:
-    metrics.SetFoundFingerprintOnLoad(found_status=metrics.kFingerprintNotFound)
-    logging.info(
-        "Fingerprint not found. Saved model loading will continue.")
-    singleprint = ""
-  except RuntimeError:
-    metrics.SetFoundFingerprintOnLoad(found_status=metrics.kFingerprintError)
-    logging.exception(
-        "Fingerprint was found, but there was an error when reading the proto. "
-        "Saved model loading will continue.")
-    singleprint = ""
-  else:
-    metrics.SetFoundFingerprintOnLoad(found_status=metrics.kFingerprintFound)
-    metrics.SetReadFingerprint(
-        fingerprint=fingerprinting_utils.to_proto(
-            fingerprint).SerializeToString())
-    singleprint = fingerprint.singleprint()
-
-  try:
-    metrics.SetReadPathAndSingleprint(path=export_dir, singleprint=singleprint)
-  except metrics.MetricException:
-    logging.info("path_and_singleprint metric could not be logged. "
-                 "Saved model loading will continue.")
-
-  if filters and loader is not None:
-    return {node_id: loader.get(node_id) for node_id in filters}
-  else:
-    return {"root": root}
+  spec = fn.concrete_functions[0].structured_input_signature[0][0]
+  for concrete in fn.concrete_functions[1:]:
+    spec2 = concrete.structured_input_signature[0][0]
+    spec = nest.map_structure(common_spec, spec, spec2)
+  return spec
 
 
-def is_tf2_saved_model(export_dir):
-  """Identifies if an exported SavedModel is a TF2 SavedModel.
+class RevivedNetwork(RevivedLayer):
+  """Keras network of layers loaded from a SavedModel."""
 
-  There are differences in SavedModel semantics between TF1 and TF2 that are
-  documented here:
-  https://www.tensorflow.org/guide/migrate/saved_model#savedmodel. This helper
-  util function serves to distinguish the TF1 vs TF2 semantics used when
-  exporting SavedModels.
+  @classmethod
+  def _init_from_metadata(cls, metadata):
+    """Create revived network from metadata stored in the SavedModel proto."""
+    revived_obj = cls(name=metadata['name'])
 
-  Args:
-    export_dir: The SavedModel directory to load from.
+    # Store attributes revived from SerializedAttributes in a un-tracked
+    # dictionary. The attributes are the ones listed in CommonEndpoints or
+    # "keras_api" for keras-specific attributes.
+    with utils.no_automatic_dependency_tracking_scope(revived_obj):
+      # pylint:disable=protected-access
+      revived_obj._expects_training_arg = metadata['expects_training_arg']
+      config = metadata.get('config')
+      if generic_utils.validate_config(config):
+        revived_obj._config = config
 
-  Returns:
-    True if TF2 SavedModel semantics are used, False if TF1 SavedModel semantics
-    are used.
-  """
-  # Try reading the fingerprint first before parsing the SavedModel proto
-  try:
-    fingerprint = fingerprinting.read_fingerprint(export_dir)
-    if fingerprint.saved_object_graph_hash != 0:
-      logging.info("SavedModel at %s is a TF2 SavedModel", export_dir)
-      return True
-  except Exception:  # pylint: disable=broad-exception-caught
-    logging.info(
-        "Failed to read fingerprint from SavedModel. Parsing MetaGraph ..."
-    )
-    saved_model_proto = loader_impl.parse_saved_model(export_dir)
-    if len(
-        saved_model_proto.meta_graphs
-    ) == 1 and saved_model_proto.meta_graphs[0].HasField("object_graph_def"):
-      logging.info("SavedModel at %s is a TF2 SavedModel", export_dir)
-      return True
+      if metadata.get('activity_regularizer') is not None:
+        revived_obj.activity_regularizer = regularizers.deserialize(
+            metadata['activity_regularizer'])
+      # pylint:enable=protected-access
 
-  logging.info("SavedModel at %s is a TF1 SavedModel", export_dir)
-  return False
+    return revived_obj, _revive_setter  # pylint:disable=protected-access
+
+
+def _set_network_attributes_from_metadata(revived_obj):
+  """Sets attributes recorded in the metadata."""
+  with utils.no_automatic_dependency_tracking_scope(revived_obj):
+    # pylint:disable=protected-access
+    metadata = revived_obj._serialized_attributes['metadata']
+    if metadata.get('dtype') is not None:
+      revived_obj._set_dtype_policy(metadata['dtype'])
+    revived_obj._trainable = metadata['trainable']
+    # pylint:enable=protected-access
+
+
+def _maybe_add_serialized_attributes(layer, metadata):
+  # Store attributes revived from SerializedAttributes in a un-tracked
+  # dictionary. The attributes are the ones listed in CommonEndpoints or
+  # "keras_api" for keras-specific attributes.
+  if not hasattr(layer, '_serialized_attributes'):
+    with utils.no_automatic_dependency_tracking_scope(layer):
+      layer._serialized_attributes = {'metadata': metadata}  # pylint: disable=protected-access
+
+
+def _get_keras_attr(layer):
+  return getattr(layer, '_serialized_attributes', {}).get(constants.KERAS_ATTR,
+                                                          None)

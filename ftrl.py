@@ -1,4 +1,4 @@
-# Copyright 2015 The TensorFlow Authors. All Rights Reserved.
+# Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,280 +12,252 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Ftrl-proximal for TensorFlow."""
-from tensorflow.python.framework import dtypes
-from tensorflow.python.framework import ops
+"""Ftrl-proximal optimizer implementation."""
+# pylint: disable=g-classes-have-attributes
+
+from tensorflow.python.keras.optimizer_v2 import optimizer_v2
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import gen_training_ops
+from tensorflow.python.ops import init_ops
 from tensorflow.python.ops import math_ops
-from tensorflow.python.training import optimizer
-from tensorflow.python.util.tf_export import tf_export
 
 
-@tf_export(v1=["train.FtrlOptimizer"])
-class FtrlOptimizer(optimizer.Optimizer):
-  """Optimizer that implements the FTRL algorithm.
+class Ftrl(optimizer_v2.OptimizerV2):
+  r"""Optimizer that implements the FTRL algorithm.
 
-  This version has support for both online L2 (McMahan et al., 2013) and
-  shrinkage-type L2, which is the addition of an L2 penalty
-  to the loss function.
+  "Follow The Regularized Leader" (FTRL) is an optimization algorithm developed
+  at Google for click-through rate prediction in the early 2010s. It is most
+  suitable for shallow models with large and sparse feature spaces.
+  The algorithm is described by
+  [McMahan et al., 2013](https://research.google.com/pubs/archive/41159.pdf).
+  The Keras version has support for both online L2 regularization
+  (the L2 regularization described in the paper
+  above) and shrinkage-type L2 regularization
+  (which is the addition of an L2 penalty to the loss function).
 
-  References:
-    Ad-click prediction:
-      [McMahan et al., 2013](https://dl.acm.org/citation.cfm?id=2488200)
-      ([pdf](https://dl.acm.org/ft_gateway.cfm?id=2488200&ftid=1388399&dwn=1&CFID=32233078&CFTOKEN=d60fe57a294c056a-CB75C374-F915-E7A6-1573FBBC7BF7D526))
+  Initialization:
+
+  ```python
+  n = 0
+  sigma = 0
+  z = 0
+  ```
+
+  Update rule for one variable `w`:
+
+  ```python
+  prev_n = n
+  n = n + g ** 2
+  sigma = (sqrt(n) - sqrt(prev_n)) / lr
+  z = z + g - sigma * w
+  if abs(z) < lambda_1:
+    w = 0
+  else:
+    w = (sgn(z) * lambda_1 - z) / ((beta + sqrt(n)) / alpha + lambda_2)
+  ```
+
+  Notation:
+
+  - `lr` is the learning rate
+  - `g` is the gradient for the variable
+  - `lambda_1` is the L1 regularization strength
+  - `lambda_2` is the L2 regularization strength
+
+  Check the documentation for the `l2_shrinkage_regularization_strength`
+  parameter for more details when shrinkage is enabled, in which case gradient
+  is replaced with a gradient with shrinkage.
+
+  Args:
+    learning_rate: A `Tensor`, floating point value, or a schedule that is a
+      `tf.keras.optimizers.schedules.LearningRateSchedule`. The learning rate.
+    learning_rate_power: A float value, must be less or equal to zero.
+      Controls how the learning rate decreases during training. Use zero for
+      a fixed learning rate.
+    initial_accumulator_value: The starting value for accumulators.
+      Only zero or positive values are allowed.
+    l1_regularization_strength: A float value, must be greater than or
+      equal to zero. Defaults to 0.0.
+    l2_regularization_strength: A float value, must be greater than or
+      equal to zero. Defaults to 0.0.
+    name: Optional name prefix for the operations created when applying
+      gradients.  Defaults to `"Ftrl"`.
+    l2_shrinkage_regularization_strength: A float value, must be greater than
+      or equal to zero. This differs from L2 above in that the L2 above is a
+      stabilization penalty, whereas this L2 shrinkage is a magnitude penalty.
+      When input is sparse shrinkage will only happen on the active weights.
+    beta: A float value, representing the beta value from the paper.
+      Defaults to 0.0.
+    **kwargs: Keyword arguments. Allowed to be one of
+      `"clipnorm"` or `"clipvalue"`.
+      `"clipnorm"` (float) clips gradients by norm; `"clipvalue"` (float) clips
+      gradients by value.
+
+  Reference:
+    - [McMahan et al., 2013](
+      https://research.google.com/pubs/archive/41159.pdf)
   """
 
   def __init__(self,
-               learning_rate,
+               learning_rate=0.001,
                learning_rate_power=-0.5,
                initial_accumulator_value=0.1,
                l1_regularization_strength=0.0,
                l2_regularization_strength=0.0,
-               use_locking=False,
-               name="Ftrl",
-               accum_name=None,
-               linear_name=None,
+               name='Ftrl',
                l2_shrinkage_regularization_strength=0.0,
-               beta=None):
-    r"""Construct a new FTRL optimizer.
-
-    Args:
-      learning_rate: A float value or a constant float `Tensor`.
-      learning_rate_power: A float value, must be less or equal to zero.
-        Controls how the learning rate decreases during training. Use zero for
-        a fixed learning rate. See section 3.1 in (McMahan et al., 2013).
-      initial_accumulator_value: The starting value for accumulators.
-        Only zero or positive values are allowed.
-      l1_regularization_strength: A float value, must be greater than or
-        equal to zero.
-      l2_regularization_strength: A float value, must be greater than or
-        equal to zero.
-      use_locking: If `True` use locks for update operations.
-      name: Optional name prefix for the operations created when applying
-        gradients.  Defaults to "Ftrl".
-      accum_name: The suffix for the variable that keeps the gradient squared
-        accumulator.  If not present, defaults to name.
-      linear_name: The suffix for the variable that keeps the linear gradient
-        accumulator.  If not present, defaults to name + "_1".
-      l2_shrinkage_regularization_strength: A float value, must be greater than
-        or equal to zero. This differs from L2 above in that the L2 above is a
-        stabilization penalty, whereas this L2 shrinkage is a magnitude penalty.
-        The FTRL formulation can be written as:
-        w_{t+1} = argmin_w(\hat{g}_{1:t}w + L1*||w||_1 + L2*||w||_2^2), where
-        \hat{g} = g + (2*L2_shrinkage*w), and g is the gradient of the loss
-        function w.r.t. the weights w.
-        Specifically, in the absence of L1 regularization, it is equivalent to
-        the following update rule:
-        w_{t+1} = w_t - lr_t / (beta + 2*L2*lr_t) * g_t -
-                  2*L2_shrinkage*lr_t / (beta + 2*L2*lr_t) * w_t
-        where lr_t is the learning rate at t.
-        When input is sparse shrinkage will only happen on the active weights.
-      beta: A float value; corresponds to the beta parameter in the paper.
-
-    Raises:
-      ValueError: If one of the arguments is invalid.
-
-    References:
-      Ad-click prediction:
-        [McMahan et al., 2013](https://dl.acm.org/citation.cfm?id=2488200)
-        ([pdf](https://dl.acm.org/ft_gateway.cfm?id=2488200&ftid=1388399&dwn=1&CFID=32233078&CFTOKEN=d60fe57a294c056a-CB75C374-F915-E7A6-1573FBBC7BF7D526))
-    """
-    super(FtrlOptimizer, self).__init__(use_locking, name)
+               beta=0.0,
+               **kwargs):
+    super(Ftrl, self).__init__(name, **kwargs)
 
     if initial_accumulator_value < 0.0:
       raise ValueError(
-          "initial_accumulator_value %f needs to be positive or zero" %
+          'initial_accumulator_value %f needs to be positive or zero' %
           initial_accumulator_value)
     if learning_rate_power > 0.0:
-      raise ValueError("learning_rate_power %f needs to be negative or zero" %
+      raise ValueError('learning_rate_power %f needs to be negative or zero' %
                        learning_rate_power)
     if l1_regularization_strength < 0.0:
       raise ValueError(
-          "l1_regularization_strength %f needs to be positive or zero" %
+          'l1_regularization_strength %f needs to be positive or zero' %
           l1_regularization_strength)
     if l2_regularization_strength < 0.0:
       raise ValueError(
-          "l2_regularization_strength %f needs to be positive or zero" %
+          'l2_regularization_strength %f needs to be positive or zero' %
           l2_regularization_strength)
     if l2_shrinkage_regularization_strength < 0.0:
       raise ValueError(
-          "l2_shrinkage_regularization_strength %f needs to be positive"
-          " or zero" % l2_shrinkage_regularization_strength)
+          'l2_shrinkage_regularization_strength %f needs to be positive'
+          ' or zero' % l2_shrinkage_regularization_strength)
 
-    self._learning_rate = learning_rate
-    self._learning_rate_power = learning_rate_power
+    self._set_hyper('learning_rate', learning_rate)
+    self._set_hyper('decay', self._initial_decay)
+    self._set_hyper('learning_rate_power', learning_rate_power)
+    self._set_hyper('l1_regularization_strength', l1_regularization_strength)
+    self._set_hyper('l2_regularization_strength', l2_regularization_strength)
+    self._set_hyper('beta', beta)
     self._initial_accumulator_value = initial_accumulator_value
-    self._l1_regularization_strength = l1_regularization_strength
-    self._l2_regularization_strength = l2_regularization_strength
-    self._beta = (0.0 if beta is None else beta)
     self._l2_shrinkage_regularization_strength = (
         l2_shrinkage_regularization_strength)
-    self._learning_rate_tensor = None
-    self._learning_rate_power_tensor = None
-    self._l1_regularization_strength_tensor = None
-    self._adjusted_l2_regularization_strength_tensor = None
-    self._l2_shrinkage_regularization_strength_tensor = None
-    self._accum_name = accum_name
-    self._linear_name = linear_name
 
   def _create_slots(self, var_list):
     # Create the "accum" and "linear" slots.
-    def _accum_initializer(shape, dtype=dtypes.float32, partition_info=None):
-      del partition_info
-      return array_ops.ones(
-          shape=shape, dtype=dtype) * self._initial_accumulator_value
-    for v in var_list:
-      self._get_or_make_slot_with_initializer(
-          v, _accum_initializer, v.shape, v.dtype, "accum",
-          self._accum_name or self._name)
-      self._zeros_slot(v, "linear", self._linear_name or self._name)
+    for var in var_list:
+      dtype = var.dtype.base_dtype
+      init = init_ops.constant_initializer(
+          self._initial_accumulator_value, dtype=dtype)
+      self.add_slot(var, 'accumulator', init)
+      self.add_slot(var, 'linear')
 
-  def _prepare(self):
-    self._learning_rate_tensor = ops.convert_to_tensor(
-        self._learning_rate, name="learning_rate")
-    self._l1_regularization_strength_tensor = ops.convert_to_tensor(
-        self._l1_regularization_strength, name="l1_regularization_strength")
-    # L2 regularization strength with beta added in so that the underlying
-    # TensorFlow ops do not need to include that parameter.
-    self._adjusted_l2_regularization_strength_tensor = ops.convert_to_tensor(
-        self._l2_regularization_strength + self._beta /
-        (2. * math_ops.maximum(self._learning_rate, 1e-36)),
-        name="adjusted_l2_regularization_strength")
-    assert self._adjusted_l2_regularization_strength_tensor is not None
-    self._beta_tensor = ops.convert_to_tensor(self._beta, name="beta")
-    self._l2_shrinkage_regularization_strength_tensor = ops.convert_to_tensor(
-        self._l2_shrinkage_regularization_strength,
-        name="l2_shrinkage_regularization_strength")
-    self._learning_rate_power_tensor = ops.convert_to_tensor(
-        self._learning_rate_power, name="learning_rate_power")
+  def _prepare_local(self, var_device, var_dtype, apply_state):
+    super(Ftrl, self)._prepare_local(var_device, var_dtype, apply_state)
+    apply_state[(var_device, var_dtype)].update(
+        dict(
+            learning_rate_power=array_ops.identity(
+                self._get_hyper('learning_rate_power', var_dtype)),
+            l1_regularization_strength=array_ops.identity(
+                self._get_hyper('l1_regularization_strength', var_dtype)),
+            l2_regularization_strength=array_ops.identity(
+                self._get_hyper('l2_regularization_strength', var_dtype)),
+            beta=array_ops.identity(self._get_hyper('beta', var_dtype)),
+            l2_shrinkage_regularization_strength=math_ops.cast(
+                self._l2_shrinkage_regularization_strength, var_dtype)))
 
-  def _apply_dense(self, grad, var):
-    accum = self.get_slot(var, "accum")
-    linear = self.get_slot(var, "linear")
+  def _resource_apply_dense(self, grad, var, apply_state=None):
+    var_device, var_dtype = var.device, var.dtype.base_dtype
+    coefficients = ((apply_state or {}).get((var_device, var_dtype))
+                    or self._fallback_apply_state(var_device, var_dtype))
+
+    # Adjust L2 regularization strength to include beta to avoid the underlying
+    # TensorFlow ops needing to include it.
+    adjusted_l2_regularization_strength = (
+        coefficients['l2_regularization_strength'] + coefficients['beta'] /
+        (2. * coefficients['lr_t']))
+
+    accum = self.get_slot(var, 'accumulator')
+    linear = self.get_slot(var, 'linear')
+
     if self._l2_shrinkage_regularization_strength <= 0.0:
-      return gen_training_ops.apply_ftrl(
-          var,
-          accum,
-          linear,
-          grad,
-          math_ops.cast(self._learning_rate_tensor, var.dtype.base_dtype),
-          math_ops.cast(self._l1_regularization_strength_tensor,
-                        var.dtype.base_dtype),
-          math_ops.cast(self._adjusted_l2_regularization_strength_tensor,
-                        var.dtype.base_dtype),
-          math_ops.cast(self._learning_rate_power_tensor, var.dtype.base_dtype),
+      return gen_training_ops.ResourceApplyFtrl(
+          var=var.handle,
+          accum=accum.handle,
+          linear=linear.handle,
+          grad=grad,
+          lr=coefficients['lr_t'],
+          l1=coefficients['l1_regularization_strength'],
+          l2=adjusted_l2_regularization_strength,
+          lr_power=coefficients['learning_rate_power'],
           use_locking=self._use_locking)
     else:
-      return gen_training_ops.apply_ftrl_v2(
-          var,
-          accum,
-          linear,
-          grad,
-          math_ops.cast(self._learning_rate_tensor, var.dtype.base_dtype),
-          math_ops.cast(self._l1_regularization_strength_tensor,
-                        var.dtype.base_dtype),
-          math_ops.cast(self._adjusted_l2_regularization_strength_tensor,
-                        var.dtype.base_dtype),
-          math_ops.cast(self._l2_shrinkage_regularization_strength_tensor,
-                        var.dtype.base_dtype),
-          math_ops.cast(self._learning_rate_power_tensor, var.dtype.base_dtype),
+      return gen_training_ops.ResourceApplyFtrlV2(
+          var=var.handle,
+          accum=accum.handle,
+          linear=linear.handle,
+          grad=grad,
+          lr=coefficients['lr_t'],
+          l1=coefficients['l1_regularization_strength'],
+          l2=adjusted_l2_regularization_strength,
+          l2_shrinkage=coefficients['l2_shrinkage_regularization_strength'],
+          lr_power=coefficients['learning_rate_power'],
           use_locking=self._use_locking)
 
-  def _resource_apply_dense(self, grad, var):
-    accum = self.get_slot(var, "accum")
-    linear = self.get_slot(var, "linear")
+  def _resource_apply_sparse(self, grad, var, indices, apply_state=None):
+    var_device, var_dtype = var.device, var.dtype.base_dtype
+    coefficients = ((apply_state or {}).get((var_device, var_dtype))
+                    or self._fallback_apply_state(var_device, var_dtype))
+
+    # Adjust L2 regularization strength to include beta to avoid the underlying
+    # TensorFlow ops needing to include it.
+    adjusted_l2_regularization_strength = (
+        coefficients['l2_regularization_strength'] + coefficients['beta'] /
+        (2. * coefficients['lr_t']))
+
+    accum = self.get_slot(var, 'accumulator')
+    linear = self.get_slot(var, 'linear')
+
     if self._l2_shrinkage_regularization_strength <= 0.0:
-      return gen_training_ops.resource_apply_ftrl(
-          var.handle,
-          accum.handle,
-          linear.handle,
-          grad,
-          math_ops.cast(self._learning_rate_tensor, var.dtype.base_dtype),
-          math_ops.cast(self._l1_regularization_strength_tensor,
-                        var.dtype.base_dtype),
-          math_ops.cast(self._adjusted_l2_regularization_strength_tensor,
-                        var.dtype.base_dtype),
-          math_ops.cast(self._learning_rate_power_tensor, var.dtype.base_dtype),
+      return gen_training_ops.ResourceSparseApplyFtrl(
+          var=var.handle,
+          accum=accum.handle,
+          linear=linear.handle,
+          grad=grad,
+          indices=indices,
+          lr=coefficients['lr_t'],
+          l1=coefficients['l1_regularization_strength'],
+          l2=adjusted_l2_regularization_strength,
+          lr_power=coefficients['learning_rate_power'],
           use_locking=self._use_locking)
     else:
-      return gen_training_ops.resource_apply_ftrl_v2(
-          var.handle,
-          accum.handle,
-          linear.handle,
-          grad,
-          math_ops.cast(self._learning_rate_tensor, var.dtype.base_dtype),
-          math_ops.cast(self._l1_regularization_strength_tensor,
-                        var.dtype.base_dtype),
-          math_ops.cast(self._adjusted_l2_regularization_strength_tensor,
-                        var.dtype.base_dtype),
-          math_ops.cast(self._l2_shrinkage_regularization_strength_tensor,
-                        var.dtype.base_dtype),
-          math_ops.cast(self._learning_rate_power_tensor, var.dtype.base_dtype),
+      return gen_training_ops.ResourceSparseApplyFtrlV2(
+          var=var.handle,
+          accum=accum.handle,
+          linear=linear.handle,
+          grad=grad,
+          indices=indices,
+          lr=coefficients['lr_t'],
+          l1=coefficients['l1_regularization_strength'],
+          l2=adjusted_l2_regularization_strength,
+          l2_shrinkage=coefficients['l2_shrinkage_regularization_strength'],
+          lr_power=coefficients['learning_rate_power'],
           use_locking=self._use_locking)
 
-  def _apply_sparse(self, grad, var):
-    accum = self.get_slot(var, "accum")
-    linear = self.get_slot(var, "linear")
-    if self._l2_shrinkage_regularization_strength <= 0.0:
-      return gen_training_ops.sparse_apply_ftrl(
-          var,
-          accum,
-          linear,
-          grad.values,
-          grad.indices,
-          math_ops.cast(self._learning_rate_tensor, var.dtype.base_dtype),
-          math_ops.cast(self._l1_regularization_strength_tensor,
-                        var.dtype.base_dtype),
-          math_ops.cast(self._adjusted_l2_regularization_strength_tensor,
-                        var.dtype.base_dtype),
-          math_ops.cast(self._learning_rate_power_tensor, var.dtype.base_dtype),
-          use_locking=self._use_locking)
-    else:
-      return gen_training_ops.sparse_apply_ftrl_v2(
-          var,
-          accum,
-          linear,
-          grad.values,
-          grad.indices,
-          math_ops.cast(self._learning_rate_tensor, var.dtype.base_dtype),
-          math_ops.cast(self._l1_regularization_strength_tensor,
-                        var.dtype.base_dtype),
-          math_ops.cast(self._adjusted_l2_regularization_strength_tensor,
-                        var.dtype.base_dtype),
-          math_ops.cast(self._l2_shrinkage_regularization_strength_tensor,
-                        grad.dtype.base_dtype),
-          math_ops.cast(self._learning_rate_power_tensor, var.dtype.base_dtype),
-          use_locking=self._use_locking)
-
-  def _resource_apply_sparse(self, grad, var, indices):
-    accum = self.get_slot(var, "accum")
-    linear = self.get_slot(var, "linear")
-    if self._l2_shrinkage_regularization_strength <= 0.0:
-      return gen_training_ops.resource_sparse_apply_ftrl(
-          var.handle,
-          accum.handle,
-          linear.handle,
-          grad,
-          indices,
-          math_ops.cast(self._learning_rate_tensor, grad.dtype),
-          math_ops.cast(self._l1_regularization_strength_tensor, grad.dtype),
-          math_ops.cast(self._adjusted_l2_regularization_strength_tensor,
-                        grad.dtype),
-          math_ops.cast(self._learning_rate_power_tensor, grad.dtype),
-          use_locking=self._use_locking)
-    else:
-      return gen_training_ops.resource_sparse_apply_ftrl_v2(
-          var.handle,
-          accum.handle,
-          linear.handle,
-          grad,
-          indices,
-          math_ops.cast(self._learning_rate_tensor, grad.dtype),
-          math_ops.cast(self._l1_regularization_strength_tensor, grad.dtype),
-          math_ops.cast(self._adjusted_l2_regularization_strength_tensor,
-                        grad.dtype),
-          math_ops.cast(self._l2_shrinkage_regularization_strength_tensor,
-                        grad.dtype),
-          math_ops.cast(self._learning_rate_power_tensor, grad.dtype),
-          use_locking=self._use_locking)
+  def get_config(self):
+    config = super(Ftrl, self).get_config()
+    config.update({
+        'learning_rate':
+            self._serialize_hyperparameter('learning_rate'),
+        'decay':
+            self._initial_decay,
+        'initial_accumulator_value':
+            self._initial_accumulator_value,
+        'learning_rate_power':
+            self._serialize_hyperparameter('learning_rate_power'),
+        'l1_regularization_strength':
+            self._serialize_hyperparameter('l1_regularization_strength'),
+        'l2_regularization_strength':
+            self._serialize_hyperparameter('l2_regularization_strength'),
+        'beta':
+            self._serialize_hyperparameter('beta'),
+        'l2_shrinkage_regularization_strength':
+            self._l2_shrinkage_regularization_strength,
+    })
+    return config

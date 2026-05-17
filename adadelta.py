@@ -1,4 +1,4 @@
-# Copyright 2015 The TensorFlow Authors. All Rights Reserved.
+# Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,187 +12,138 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+"""Adadelta optimizer implementation."""
+# pylint: disable=g-classes-have-attributes
 
-"""Adadelta for TensorFlow."""
-from tensorflow.python.framework import ops
+import numpy as np
+from tensorflow.python.framework import tensor_conversion
+from tensorflow.python.keras import backend_config
+from tensorflow.python.keras.optimizer_v2 import optimizer_v2
+from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import gen_training_ops
-from tensorflow.python.ops import math_ops
-from tensorflow.python.training import optimizer
-from tensorflow.python.util.tf_export import tf_export
 
 
-@tf_export(v1=["train.AdadeltaOptimizer"])
-class AdadeltaOptimizer(optimizer.Optimizer):
-  """Optimizer that implements the Adadelta algorithm.
+class Adadelta(optimizer_v2.OptimizerV2):
+  r"""Optimizer that implements the Adadelta algorithm.
 
-  References:
-    ADADELTA - An Adaptive Learning Rate Method:
-      [Zeiler, 2012](http://arxiv.org/abs/1212.5701)
-      ([pdf](http://arxiv.org/pdf/1212.5701v1.pdf))
+  Adadelta optimization is a stochastic gradient descent method that is based on
+  adaptive learning rate per dimension to address two drawbacks:
 
-  @compatibility(TF2)
-  tf.compat.v1.train.AdadeltaOptimizer is compatible with eager mode and
-  `tf.function`.
-  When eager execution is enabled, `learning_rate`, `rho`,
-  and `epsilon` can each be a callable that
-  takes no arguments and returns the actual value to use. This can be useful
-  for changing these values across different invocations of optimizer
-  functions.
+  - The continual decay of learning rates throughout training.
+  - The need for a manually selected global learning rate.
 
-  To switch to native TF2 style, use [`tf.keras.optimizers.Adadelta`]
-  (https://www.tensorflow.org/api_docs/python/tf/keras/optimizers/Adadelta)
-  instead. Please notice that due to the implementation differences,
-  `tf.keras.optimizers.Adadelta` and
-  `tf.compat.v1.train.AdadeltaOptimizer` may have slight differences in
-  floating point numerics even though the formula used for the variable
-  updates still matches.
+  Adadelta is a more robust extension of Adagrad that adapts learning rates
+  based on a moving window of gradient updates, instead of accumulating all
+  past gradients. This way, Adadelta continues learning even when many updates
+  have been done. Compared to Adagrad, in the original version of Adadelta you
+  don't have to set an initial learning rate. In this version, the initial
+  learning rate can be set, as in most other Keras optimizers.
 
-  #### Structural mapping to native TF2
+  Args:
+    learning_rate: Initial value for the learning rate:
+      either a floating point value,
+      or a `tf.keras.optimizers.schedules.LearningRateSchedule` instance.
+      Defaults to 0.001.
+      Note that `Adadelta` tends to benefit from higher initial learning rate
+      values compared to other optimizers.
+      To match the exact form in the original paper, use 1.0.
+    rho: A `Tensor` or a floating point value. The decay rate.
+    epsilon: Small floating point value used to maintain numerical stability.
+    name: Optional name prefix for the operations created when applying
+      gradients.  Defaults to `"Adadelta"`.
+    **kwargs: Keyword arguments. Allowed to be one of
+      `"clipnorm"` or `"clipvalue"`.
+      `"clipnorm"` (float) clips gradients by norm and represents
+      the maximum norm of each parameter;
+      `"clipvalue"` (float) clips gradient by value and represents the
+      maximum absolute value of each parameter.
 
-  Before:
-
-  ```python
-  optimizer = tf.compat.v1.train.AdadeltaOptimizer(
-    learning_rate=learning_rate,
-    rho=rho,
-    epsilon=epsilon)
-  ```
-
-  After:
-
-  ```python
-  optimizer = tf.keras.optimizers.Adadelta(
-    learning_rate=learning_rate,
-    rho=rho,
-    epsilon=epsilon)
-  ```
-
-  #### How to map arguments
-  | TF1 Arg Name       | TF2 Arg Name   | Note                             |
-  | ------------------ | -------------  | -------------------------------  |
-  | `learning_rate`    | `learning_rate`| Be careful of setting           |
-  : : : learning_rate tensor value computed from the global step.          :
-  : : : In TF1 this was usually meant to imply a dynamic learning rate and :
-  : : : would recompute in each step. In TF2 (eager + function) it will    :
-  : : : treat it as a scalar value that only gets computed once instead of :
-  : : : a symbolic placeholder to be computed each time.                   :
-  | `rho`              | `rho`          | -                                |
-  | `epsilon`          | `epsilon`      | Default value is 1e-08 in TF1,   |
-  :                    :                : but 1e-07 in TF2.                :
-  | `use_locking`      | -              | Not applicable in TF2.           |
-
-  #### Before & after usage example
-  Before:
-
-  ```python
-  x = tf.Variable([1,2,3], dtype=tf.float32)
-  grad = tf.constant([0.1, 0.2, 0.3])
-  optimizer = tf.compat.v1.train.AdadeltaOptimizer(learning_rate=0.001)
-  optimizer.apply_gradients(zip([grad], [x]))
-  ```
-
-  After:
-
-  ```python
-  x = tf.Variable([1,2,3], dtype=tf.float32)
-  grad = tf.constant([0.1, 0.2, 0.3])
-  optimizer = tf.keras.optimizers.Adadelta(learning_rate=0.001)
-  optimizer.apply_gradients(zip([grad], [x]))
-  ```
-
-  @end_compatibility
+  Reference:
+    - [Zeiler, 2012](http://arxiv.org/abs/1212.5701)
   """
 
-  def __init__(self, learning_rate=0.001, rho=0.95, epsilon=1e-8,
-               use_locking=False, name="Adadelta"):
-    """Construct a new Adadelta optimizer.
+  _HAS_AGGREGATE_GRAD = True
 
-    Args:
-      learning_rate: A `Tensor` or a floating point value. The learning rate.
-        To match the exact form in the original paper use 1.0.
-      rho: A `Tensor` or a floating point value. The decay rate.
-      epsilon: A `Tensor` or a floating point value.  A constant epsilon used
-               to better conditioning the grad update.
-      use_locking: If `True` use locks for update operations.
-      name: Optional name prefix for the operations created when applying
-        gradients.  Defaults to "Adadelta".
-
-
-    """
-    super(AdadeltaOptimizer, self).__init__(use_locking, name)
-    self._lr = learning_rate
-    self._rho = rho
-    self._epsilon = epsilon
-
-    # Tensor versions of the constructor arguments, created in _prepare().
-    self._lr_t = None
-    self._rho_t = None
-    self._epsilon_t = None
+  def __init__(self,
+               learning_rate=0.001,
+               rho=0.95,
+               epsilon=1e-7,
+               name='Adadelta',
+               **kwargs):
+    super(Adadelta, self).__init__(name, **kwargs)
+    self._set_hyper('learning_rate', kwargs.get('lr', learning_rate))
+    self._set_hyper('decay', self._initial_decay)
+    self._set_hyper('rho', rho)
+    self.epsilon = epsilon or backend_config.epsilon()
 
   def _create_slots(self, var_list):
+    # Separate for-loops to respect the ordering of slot variables from v1.
     for v in var_list:
-      self._zeros_slot(v, "accum", self._name)
-      self._zeros_slot(v, "accum_update", self._name)
+      self.add_slot(v, 'accum_grad')
+    for v in var_list:
+      self.add_slot(v, 'accum_var')
 
-  def _prepare(self):
-    lr = self._call_if_callable(self._lr)
-    rho = self._call_if_callable(self._rho)
-    epsilon = self._call_if_callable(self._epsilon)
+  def _prepare_local(self, var_device, var_dtype, apply_state):
+    super(Adadelta, self)._prepare_local(var_device, var_dtype, apply_state)
+    apply_state[(var_device, var_dtype)].update(
+        dict(
+            epsilon=tensor_conversion.convert_to_tensor_v2_with_dispatch(
+                self.epsilon, var_dtype
+            ),
+            rho=array_ops.identity(self._get_hyper('rho', var_dtype)),
+        )
+    )
 
-    self._lr_t = ops.convert_to_tensor(lr, name="lr")
-    self._rho_t = ops.convert_to_tensor(rho, name="rho")
-    self._epsilon_t = ops.convert_to_tensor(epsilon, name="epsilon")
+  def set_weights(self, weights):
+    params = self.weights
+    # Override set_weights for backward compatibility of Keras V1 optimizer
+    # since it does not include iteration at head of the weight list. Set
+    # iteration to 0.
+    if len(params) == len(weights) + 1:
+      weights = [np.array(0)] + weights
+    super(Adadelta, self).set_weights(weights)
 
-  def _apply_dense(self, grad, var):
-    accum = self.get_slot(var, "accum")
-    accum_update = self.get_slot(var, "accum_update")
-    return gen_training_ops.apply_adadelta(
-        var,
-        accum,
-        accum_update,
-        math_ops.cast(self._lr_t, var.dtype.base_dtype),
-        math_ops.cast(self._rho_t, var.dtype.base_dtype),
-        math_ops.cast(self._epsilon_t, var.dtype.base_dtype),
-        grad,
+  def _resource_apply_dense(self, grad, var, apply_state=None):
+    var_device, var_dtype = var.device, var.dtype.base_dtype
+    coefficients = ((apply_state or {}).get((var_device, var_dtype))
+                    or self._fallback_apply_state(var_device, var_dtype))
+
+    accum_grad = self.get_slot(var, 'accum_grad')
+    accum_var = self.get_slot(var, 'accum_var')
+    return gen_training_ops.ResourceApplyAdadelta(
+        var=var.handle,
+        accum=accum_grad.handle,
+        accum_update=accum_var.handle,
+        lr=coefficients['lr_t'],
+        rho=coefficients['rho'],
+        epsilon=coefficients['epsilon'],
+        grad=grad,
         use_locking=self._use_locking)
 
-  def _resource_apply_dense(self, grad, var):
-    accum = self.get_slot(var, "accum")
-    accum_update = self.get_slot(var, "accum_update")
-    return gen_training_ops.resource_apply_adadelta(
-        var.handle,
-        accum.handle,
-        accum_update.handle,
-        math_ops.cast(self._lr_t, grad.dtype.base_dtype),
-        math_ops.cast(self._rho_t, grad.dtype.base_dtype),
-        math_ops.cast(self._epsilon_t, grad.dtype.base_dtype),
-        grad,
+  def _resource_apply_sparse(self, grad, var, indices, apply_state=None):
+    var_device, var_dtype = var.device, var.dtype.base_dtype
+    coefficients = ((apply_state or {}).get((var_device, var_dtype))
+                    or self._fallback_apply_state(var_device, var_dtype))
+
+    accum_grad = self.get_slot(var, 'accum_grad')
+    accum_var = self.get_slot(var, 'accum_var')
+    return gen_training_ops.ResourceSparseApplyAdadelta(
+        var=var.handle,
+        accum=accum_grad.handle,
+        accum_update=accum_var.handle,
+        lr=coefficients['lr_t'],
+        rho=coefficients['rho'],
+        epsilon=coefficients['epsilon'],
+        grad=grad,
+        indices=indices,
         use_locking=self._use_locking)
 
-  def _apply_sparse(self, grad, var):
-    accum = self.get_slot(var, "accum")
-    accum_update = self.get_slot(var, "accum_update")
-    return gen_training_ops.sparse_apply_adadelta(
-        var,
-        accum,
-        accum_update,
-        math_ops.cast(self._lr_t, var.dtype.base_dtype),
-        math_ops.cast(self._rho_t, var.dtype.base_dtype),
-        math_ops.cast(self._epsilon_t, var.dtype.base_dtype),
-        grad.values,
-        grad.indices,
-        use_locking=self._use_locking)
-
-  def _resource_apply_sparse(self, grad, var, indices):
-    accum = self.get_slot(var, "accum")
-    accum_update = self.get_slot(var, "accum_update")
-    return gen_training_ops.resource_sparse_apply_adadelta(
-        var.handle,
-        accum.handle,
-        accum_update.handle,
-        math_ops.cast(self._lr_t, grad.dtype),
-        math_ops.cast(self._rho_t, grad.dtype),
-        math_ops.cast(self._epsilon_t, grad.dtype),
-        grad,
-        indices,
-        use_locking=self._use_locking)
+  def get_config(self):
+    config = super(Adadelta, self).get_config()
+    config.update({
+        'learning_rate': self._serialize_hyperparameter('learning_rate'),
+        'decay': self._initial_decay,
+        'rho': self._serialize_hyperparameter('rho'),
+        'epsilon': self.epsilon,
+    })
+    return config
