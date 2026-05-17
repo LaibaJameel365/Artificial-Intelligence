@@ -1,4 +1,4 @@
-# Copyright 2015 The TensorFlow Authors. All Rights Reserved.
+# Copyright 2017 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,54 +12,91 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Loader functionality for SavedModel with hermetic, language-neutral exports.
+"""Converting AST to code and Python entities.
 
-Load and restore capability for a SavedModel, which may include multiple meta
-graph defs. Each SavedModel is associated with a single checkpoint. Each meta
-graph def is saved with one or more tags, which are used to identify the exact
-meta graph def to load.
-
-The `load` operation requires the session in which to restore the graph
-definition and variables, the tags used to identify the meta graph def to
-load and the location of the SavedModel.
-
-Upon a load, the subset of variables and assets supplied as part of the specific
-meta graph def, will be restored into the supplied session. The values of the
-variables though will correspond to the saved values from the first meta graph
-added to the SavedModel using `add_meta_graph_and_variables(...)` in
-`builder.py`.
-
-Typical usage:
-
-```python
-...
-builder = tf.compat.v1.saved_model.builder.SavedModelBuilder(export_dir)
-
-with tf.compat.v1.Session(graph=tf.Graph()) as sess:
-  ...
-  builder.add_meta_graph_and_variables(sess,
-                                       ["foo-tag"],
-                                       signature_def_map=foo_signatures,
-                                       assets_collection=foo_assets)
-...
-
-with tf.compat.v1.Session(graph=tf.Graph()) as sess:
-  ...
-  builder.add_meta_graph(["bar-tag", "baz-tag"],
-                         assets_collection=bar_baz_assets)
-...
-
-builder.save()
-
-...
-with tf.compat.v1.Session(graph=tf.Graph()) as sess:
-  tf.compat.v1.saved_model.loader.load(sess, ["foo-tag"], export_dir)
-  ...
-
-```
+Adapted from Tangent.
 """
 
-# pylint: disable=unused-import
-from tensorflow.python.saved_model.loader_impl import load
-from tensorflow.python.saved_model.loader_impl import maybe_saved_model_directory
-# pylint: enable=unused-import
+import atexit
+import errno
+import importlib
+import os
+import sys
+import tempfile
+
+from tensorflow.python.autograph.pyct import origin_info
+from tensorflow.python.autograph.pyct import parser
+
+
+def _remove_file(file_name):
+  """Remove a file, if it exists."""
+  try:
+    os.remove(file_name)
+  except OSError as e:
+    if e.errno == errno.ENOENT:
+      # The file disappeared. Ignore this. Temporary files might get
+      # cleaned up, especially if they reside in /tmp.
+      pass
+    else:
+      raise
+
+
+def load_source(source, delete_on_exit):
+  """Loads the given source code as a Python module."""
+  with tempfile.NamedTemporaryFile(
+      mode='w',
+      suffix='.py',
+      prefix='__autograph_generated_file',
+      delete=False,
+      encoding='utf-8') as f:
+    module_name = os.path.basename(f.name[:-3])
+    file_name = f.name
+    f.write(source)
+
+  if delete_on_exit:
+    atexit.register(lambda: _remove_file(file_name))
+
+  spec = importlib.util.spec_from_file_location(module_name, file_name)
+  module = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(module)
+  # TODO(mdan): Use our own garbage-collected cache instead of sys.modules.
+  sys.modules[module_name] = module
+  return module, file_name
+
+
+def load_ast(nodes,
+             indentation='  ',
+             include_source_map=False,
+             delete_on_exit=True):
+  """Loads the given AST as a Python module.
+
+  Compiling the AST code this way ensures that the source code is readable by
+  e.g. `pdb` or `inspect`.
+
+  Args:
+    nodes: Union[ast.AST, Iterable[ast.AST]], the code to compile, as an AST
+      object.
+    indentation: Text, the string to use for indentation.
+    include_source_map: bool, whether return a source map.
+    delete_on_exit: bool, whether to delete the temporary file used for
+      compilation on exit.
+
+  Returns:
+    Tuple[module, Text, Dict[LineLocation, OriginInfo]], containing:
+    the module containing the unparsed nodes, the source code corresponding to
+    nodes, and the source map. Is include_source_map is False, the source map
+    will be None.
+  """
+  if not isinstance(nodes, (list, tuple)):
+    nodes = (nodes,)
+
+  source = parser.unparse(nodes, indentation=indentation)
+  module, _ = load_source(source, delete_on_exit)
+
+  if include_source_map:
+    source_map = origin_info.create_source_map(nodes, source, module.__file__)
+  else:
+    source_map = None
+
+  # TODO(mdan): Return a structured object.
+  return module, source, source_map
