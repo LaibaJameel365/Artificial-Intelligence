@@ -1,4 +1,4 @@
-# Copyright 2015 The TensorFlow Authors. All Rights Reserved.
+# Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,92 +12,70 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Traversing Python modules and classes."""
+"""Helpers to traverse the Dataset dependency structure."""
+import queue
 
-import enum
-import sys
-
-from tensorflow.python.util import tf_inspect
-
-__all__ = ['traverse']
+from tensorflow.python.framework import dtypes
 
 
-def _traverse_internal(root, visit, stack, path):
-  """Internal helper for traverse."""
-
-  # Only traverse modules and classes
-  if not tf_inspect.isclass(root) and not tf_inspect.ismodule(root):
-    return
-
-  try:
-    children = tf_inspect.getmembers(root)
-
-    # Add labels for duplicate values in Enum.
-    if tf_inspect.isclass(root) and issubclass(root, enum.Enum):
-      for enum_member in root.__members__.items():
-        if enum_member not in children:
-          children.append(enum_member)
-      children = sorted(children)
-  except ImportError:
-    # Children could be missing for one of two reasons:
-    # 1. On some Python installations, some modules do not support enumerating
-    #    members, leading to import errors.
-    # 2. Children are lazy-loaded.
-    try:
-      children = []
-      for child_name in root.__all__:
-        children.append((child_name, getattr(root, child_name)))
-    except AttributeError:
-      children = []
-
-  new_stack = stack + [root]
-  visit(path, root, children)
-  for name, child in children:
-    # Do not descend into built-in modules
-    if tf_inspect.ismodule(
-        child) and child.__name__ in sys.builtin_module_names:
-      continue
-
-    # Break cycles
-    if any(child is item for item in new_stack):  # `in`, but using `is`
-      continue
-
-    child_path = path + '.' + name if path else name
-    _traverse_internal(child, visit, new_stack, child_path)
+OP_TYPES_ALLOWLIST = ["DummyIterationCounter"]
+# We allowlist all ops that produce variant tensors as output. This is a bit
+# of overkill but the other dataset _inputs() traversal strategies can't
+# cover the case of function inputs that capture dataset variants.
+TENSOR_TYPES_ALLOWLIST = [dtypes.variant]
 
 
-def traverse(root, visit):
-  """Recursively enumerate all members of `root`.
+def _traverse(dataset, op_filter_fn):
+  """Traverse a dataset graph, returning nodes matching `op_filter_fn`."""
+  result = []
+  bfs_q = queue.Queue()
+  bfs_q.put(dataset._variant_tensor.op)  # pylint: disable=protected-access
+  visited = []
+  while not bfs_q.empty():
+    op = bfs_q.get()
+    visited.append(op)
+    if op_filter_fn(op):
+      result.append(op)
+    for i in op.inputs:
+      input_op = i.op
+      if input_op not in visited:
+        bfs_q.put(input_op)
+  return result
 
-  Similar to the Python library function `os.path.walk`.
 
-  Traverses the tree of Python objects starting with `root`, depth first.
-  Parent-child relationships in the tree are defined by membership in modules or
-  classes. The function `visit` is called with arguments
-  `(path, parent, children)` for each module or class `parent` found in the tree
-  of python objects starting with `root`. `path` is a string containing the name
-  with which `parent` is reachable from the current context. For example, if
-  `root` is a local class called `X` which contains a class `Y`, `visit` will be
-  called with `('Y', X.Y, children)`).
+def obtain_capture_by_value_ops(dataset):
+  """Given an input dataset, finds all allowlisted ops used for construction.
 
-  If `root` is not a module or class, `visit` is never called. `traverse`
-  never descends into built-in modules.
-
-  `children`, a list of `(name, object)` pairs are determined by
-  `tf_inspect.getmembers`. To avoid visiting parts of the tree, `children` can
-  be modified in place, using `del` or slice assignment.
-
-  Cycles (determined by reference equality, `is`) stop the traversal. A stack of
-  objects is kept to find cycles. Objects forming cycles may appear in
-  `children`, but `visit` will not be called with any object as `parent` which
-  is already in the stack.
-
-  Traversing system modules can take a long time, it is advisable to pass a
-  `visit` callable which denylists such modules.
+  Allowlisted ops are stateful ops which are known to be safe to capture by
+  value.
 
   Args:
-    root: A python object with which to start the traversal.
-    visit: A function taking arguments `(path, parent, children)`. Will be
-      called for each object found in the traversal.
+    dataset: Dataset to find allowlisted stateful ops for.
+
+  Returns:
+    A list of variant_tensor producing dataset ops used to construct this
+    dataset.
   """
-  _traverse_internal(root, visit, [], '')
+
+  def capture_by_value(op):
+    return (op.outputs[0].dtype in TENSOR_TYPES_ALLOWLIST or
+            op.type in OP_TYPES_ALLOWLIST)
+
+  return _traverse(dataset, capture_by_value)
+
+
+def obtain_all_variant_tensor_ops(dataset):
+  """Given an input dataset, finds all dataset ops used for construction.
+
+  A series of transformations would have created this dataset with each
+  transformation including zero or more Dataset ops, each producing a dataset
+  variant tensor. This method outputs all of them.
+
+  Args:
+    dataset: Dataset to find variant tensors for.
+
+  Returns:
+    A list of variant_tensor producing dataset ops used to construct this
+    dataset.
+  """
+  return _traverse(dataset, lambda op: op.outputs[0].dtype == dtypes.variant)
