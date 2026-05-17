@@ -1,4 +1,4 @@
-# Copyright 2023 The TensorFlow Authors. All Rights Reserved.
+# Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,5 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Core module for TensorFlow distribution objects and helpers."""
-from tensorflow.python.ops.distributions import distributions
+"""Ragged Tensors.
+
+This package defines ops for manipulating ragged tensors (`tf.RaggedTensor`),
+which are tensors with non-uniform shapes.  In particular, each `RaggedTensor`
+has one or more *ragged dimensions*, which are dimensions whose slices may have
+different lengths.  For example, the inner (column) dimension of
+`rt=[[3, 1, 4, 1], [], [5, 9, 2], [6], []]` is ragged, since the column slices
+(`rt[0, :]`, ..., `rt[4, :]`) have different lengths.  For a more detailed
+description of ragged tensors, see the `tf.RaggedTensor` class documentation
+and the [Ragged Tensor Guide](/guide/ragged_tensor).
+
+API docstring: tensorflow.ragged
+"""
+from tensorflow.python.ops.ragged import ragged_tensor
