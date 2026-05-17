@@ -13,6 +13,21 @@
 # limitations under the License.
 # ==============================================================================
 
-from . import constants as constants, fingerprinting as fingerprinting, merger as merger, metrics as metrics
-
-def Save(arg0: str) -> None: ...
+ASSETS_DIRECTORY: str
+ASSETS_KEY: str
+DEBUG_DIRECTORY: str
+DEBUG_INFO_FILENAME_PB: str
+EXTRA_ASSETS_DIRECTORY: str
+FINGERPRINT_FILENAME: str
+INIT_OP_SIGNATURE_KEY: str
+LEGACY_INIT_OP_KEY: str
+MAIN_OP_KEY: str
+SAVED_MODEL_FILENAME_CPB: str
+SAVED_MODEL_FILENAME_PB: str
+SAVED_MODEL_FILENAME_PBTXT: str
+SAVED_MODEL_FILENAME_PREFIX: str
+SAVED_MODEL_SCHEMA_VERSION: int
+TRAIN_OP_KEY: str
+TRAIN_OP_SIGNATURE_KEY: str
+VARIABLES_DIRECTORY: str
+VARIABLES_FILENAME: str
