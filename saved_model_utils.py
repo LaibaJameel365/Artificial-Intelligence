@@ -1,4 +1,4 @@
-# Copyright 2017 The TensorFlow Authors. All Rights Reserved.
+# Copyright 2022 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,116 +12,71 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""SavedModel utils."""
+# pylint: disable=unidiomatic-typecheck
+"""A shim layer for working with functions exported/restored from saved models.
 
-import os
+This functionality should ultimately be moved into a first-class core API.
+"""
 
-from google.protobuf import message
-from google.protobuf import text_format
-from tensorflow.core.protobuf import saved_model_pb2
-from tensorflow.python.lib.io import file_io
-from tensorflow.python.saved_model import constants
-from tensorflow.python.util import compat
+import numpy
 
-
-def read_saved_model(saved_model_dir):
-  """Reads the saved_model.pb or saved_model.pbtxt file containing `SavedModel`.
-
-  Args:
-    saved_model_dir: Directory containing the SavedModel file.
-
-  Returns:
-    A `SavedModel` protocol buffer.
-
-  Raises:
-    IOError: If the file does not exist, or cannot be successfully parsed.
-  """
-  # Build the path to the SavedModel in pbtxt format.
-  path_to_pbtxt = os.path.join(
-      compat.as_bytes(saved_model_dir),
-      compat.as_bytes(constants.SAVED_MODEL_FILENAME_PBTXT))
-  # Build the path to the SavedModel in pb format.
-  path_to_pb = os.path.join(
-      compat.as_bytes(saved_model_dir),
-      compat.as_bytes(constants.SAVED_MODEL_FILENAME_PB))
-
-  # Ensure that the SavedModel exists at either path.
-  if not file_io.file_exists(path_to_pbtxt) and not file_io.file_exists(
-      path_to_pb):
-    raise IOError("SavedModel file does not exist at: %s" % saved_model_dir)
-
-  # Parse the SavedModel protocol buffer.
-  saved_model = saved_model_pb2.SavedModel()
-  if file_io.file_exists(path_to_pb):
-    with file_io.FileIO(path_to_pb, "rb") as f:
-      file_content = f.read()
-    try:
-      saved_model.ParseFromString(file_content)
-      return saved_model
-    except message.DecodeError as e:
-      raise IOError("Cannot parse proto file %s: %s." % (path_to_pb, str(e)))
-  elif file_io.file_exists(path_to_pbtxt):
-    with file_io.FileIO(path_to_pbtxt, "rb") as f:
-      file_content = f.read()
-    try:
-      text_format.Merge(file_content.decode("utf-8"), saved_model)
-      return saved_model
-    except text_format.ParseError as e:
-      raise IOError("Cannot parse pbtxt file %s: %s." % (path_to_pbtxt, str(e)))
-  else:
-    raise IOError("SavedModel file does not exist at: %s/{%s|%s}" %
-                  (saved_model_dir, constants.SAVED_MODEL_FILENAME_PBTXT,
-                   constants.SAVED_MODEL_FILENAME_PB))
+from tensorflow.python.framework import constant_op
+from tensorflow.python.framework import dtypes
+from tensorflow.python.framework import ops
+from tensorflow.python.framework import tensor_util
+from tensorflow.python.saved_model import registration
+from tensorflow.python.trackable import base as trackable
 
 
-def get_saved_model_tag_sets(saved_model_dir):
-  """Retrieves all the tag-sets available in the SavedModel.
+@registration.register_tf_serializable()
+class TrackableConstant(trackable.Trackable):
+  """Trackable class for captured constants."""
+  __slots__ = ("capture", "function", "_exported_tensor")
 
-  Args:
-    saved_model_dir: Directory containing the SavedModel.
+  def __init__(self, capture, function):
+    self.capture = capture
+    self.function = function
+    self._exported_tensor = None
 
-  Returns:
-    List of all tag-sets in the SavedModel, where a tag-set is represented as a
-    list of strings.
-  """
-  saved_model = read_saved_model(saved_model_dir)
-  all_tags = []
-  for meta_graph_def in saved_model.meta_graphs:
-    all_tags.append(list(meta_graph_def.meta_info_def.tags))
-  return all_tags
+  def _export_to_saved_model_graph(self, tensor_map, **unused_kwargs):
+    capture_constant_value = tensor_util.constant_value(self.capture)
+    if capture_constant_value is None:
+      raise ValueError(
+          f"Unable to save function {self.function.name} because it "
+          f"captures graph tensor {self.capture} from a parent function which "
+          "cannot be converted to a constant with `tf.get_static_value`.")
 
-
-def get_meta_graph_def(saved_model_dir, tag_set):
-  """Gets MetaGraphDef from SavedModel.
-
-  Returns the MetaGraphDef for the given tag-set and SavedModel directory.
-
-  Args:
-    saved_model_dir: Directory containing the SavedModel to inspect.
-    tag_set: Group of tag(s) of the MetaGraphDef to load, in string format,
-        separated by ','. The empty string tag is ignored so that passing ''
-        means the empty tag set. For tag-set contains multiple tags, all tags
-        must be passed in.
-
-  Raises:
-    RuntimeError: An error when the given tag-set does not exist in the
-        SavedModel.
-
-  Returns:
-    A MetaGraphDef corresponding to the tag-set.
-  """
-  saved_model = read_saved_model(saved_model_dir)
-  # Note: Discard empty tags so that "" can mean the empty tag set.
-  set_of_tags = set([tag for tag in tag_set.split(",") if tag])
-
-  valid_tags = []
-  for meta_graph_def in saved_model.meta_graphs:
-    meta_graph_tags = set(meta_graph_def.meta_info_def.tags)
-    if meta_graph_tags == set_of_tags:
-      return meta_graph_def
+    if numpy.prod(self.capture.shape.as_list()) > 1 and numpy.all(
+        capture_constant_value == capture_constant_value.flat[0]):
+      # For the common case of a constant array filled with the same
+      # value, rebuild the constant op specifically with the shape arg,
+      # since otherwise the whole array is written into the node def,
+      # causing performance and graph proto size issues (protos cannot be
+      # bigger than 2GB).
+      copied_tensor = constant_op.constant(
+          capture_constant_value.flat[0],
+          dtype=self.capture.dtype,
+          shape=self.capture.shape)
     else:
-      valid_tags.append(",".join(meta_graph_tags))
+      copied_tensor = constant_op.constant(capture_constant_value)
 
-  raise RuntimeError(
-      f"MetaGraphDef associated with tag-set {tag_set} could not be found in "
-      f"the SavedModel. Please use one of the following tag-sets: {valid_tags}")
+    tensor_map[self.capture] = copied_tensor
+    self._exported_tensor = copied_tensor
+    return [self.capture]
+
+  def _serialize_to_proto(self, object_proto=None, **kwargs):
+    object_proto.constant.operation = self._exported_tensor.op.name
+
+  @classmethod
+  def _deserialize_from_proto(cls, object_proto, operation_attributes,
+                              **kwargs):
+    tensor_proto = (
+        operation_attributes[object_proto.constant.operation]["value"].tensor)
+    ndarray = tensor_util.MakeNdarray(tensor_proto)
+    if dtypes.as_dtype(tensor_proto.dtype) == dtypes.string:
+      with ops.device("CPU"):
+        # String operations should be done on the CPU.
+        imported_constant = constant_op.constant(ndarray)
+    else:
+      imported_constant = constant_op.constant(ndarray)
+    return imported_constant
